@@ -64,7 +64,7 @@ endif
 config DEFAULT_MPTCP_PM
 	string
 	default "default" if DEFAULT_DUMMY
-	default "fullmesh" if DEFAULT_FULLMESH 
+	default "fullmesh" if DEFAULT_FULLMESH
 	default "ndiffports" if DEFAULT_NDIFFPORTS
 	default "binder" if DEFAULT_BINDER
 	default "default"
@@ -85,6 +85,18 @@ config MPTCP_ROUNDROBIN
 	  This is a very simple round-robin scheduler. Probably has bad performance
 	  but might be interesting for researchers.
 
+config MPTCP_METRIC
+	tristate "MPTCP metric based scheduler"
+	depends on (MPTCP=y)
+	---help---
+	  Metric based scheduler, experimental
+
+config MPTCP_SERVER
+	tristate "MPTCP Server Scheduler"
+	depends on (MPTCP=y)
+	---help---
+	  Special scheduler for servers, sends packets on subflow having received the last packet. If not, regular RTT-based scheduler.
+
 choice
 	prompt "Default MPTCP Scheduler"
 	default DEFAULT
@@ -103,6 +115,16 @@ choice
 		  This is the round-rob scheduler, sending in a round-robin
 		  fashion..
 
+	config DEFAULT_METRIC
+		bool "Metric" if MPTCP_METRIC=y
+		---help---
+		  Metric based scheduler
+
+	config DEFAULT_SERVER
+		bool "Server" if MPTCP_SERVER=y
+		---help---
+		  This sends packets on subflow having received the last packet.
+
 endchoice
 endif
 
@@ -111,5 +133,11 @@ config DEFAULT_MPTCP_SCHED
 	depends on (MPTCP=y)
 	default "default" if DEFAULT_SCHEDULER
 	default "roundrobin" if DEFAULT_ROUNDROBIN
+	default "server" if DEFAULT_SERVER
 	default "default"
 
+config MPTCP_ORACLE
+	tristate "MPTCP Oracle"
+	depends on (MPTCP=y)
+	---help---
+	  This is the oracle that monitors paths and interfaces

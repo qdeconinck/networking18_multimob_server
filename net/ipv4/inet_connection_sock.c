@@ -363,7 +363,8 @@ EXPORT_SYMBOL(inet_csk_accept);
 void inet_csk_init_xmit_timers(struct sock *sk,
 			       void (*retransmit_handler)(unsigned long),
 			       void (*delack_handler)(unsigned long),
-			       void (*keepalive_handler)(unsigned long))
+			       void (*keepalive_handler)(unsigned long),
+			       void (*receive_handler)(unsigned long))
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
 
@@ -372,6 +373,9 @@ void inet_csk_init_xmit_timers(struct sock *sk,
 	setup_timer(&icsk->icsk_delack_timer, delack_handler,
 			(unsigned long)sk);
 	setup_timer(&sk->sk_timer, keepalive_handler, (unsigned long)sk);
+	if (receive_handler)
+		setup_timer(&sk->sk_rcv_timer, receive_handler,
+			    (unsigned long)sk);
 	icsk->icsk_pending = icsk->icsk_ack.pending = 0;
 }
 EXPORT_SYMBOL(inet_csk_init_xmit_timers);
@@ -385,6 +389,7 @@ void inet_csk_clear_xmit_timers(struct sock *sk)
 	sk_stop_timer(sk, &icsk->icsk_retransmit_timer);
 	sk_stop_timer(sk, &icsk->icsk_delack_timer);
 	sk_stop_timer(sk, &sk->sk_timer);
+	sk_stop_timer(sk, &sk->sk_rcv_timer);
 }
 EXPORT_SYMBOL(inet_csk_clear_xmit_timers);
 

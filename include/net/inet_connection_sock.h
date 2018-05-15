@@ -167,7 +167,8 @@ enum inet_csk_ack_state_t {
 void inet_csk_init_xmit_timers(struct sock *sk,
 			       void (*retransmit_handler)(unsigned long),
 			       void (*delack_handler)(unsigned long),
-			       void (*keepalive_handler)(unsigned long));
+			       void (*keepalive_handler)(unsigned long),
+			       void (*receive_handler)(unsigned long));
 void inet_csk_clear_xmit_timers(struct sock *sk);
 
 static inline void inet_csk_schedule_ack(struct sock *sk)

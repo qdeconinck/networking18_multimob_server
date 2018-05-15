@@ -4,7 +4,7 @@
  *  Copyright (C) 1991, 1992  Linus Torvalds
  */
 
-#include <linux/slab.h> 
+#include <linux/slab.h>
 #include <linux/stat.h>
 #include <linux/fcntl.h>
 #include <linux/file.h>
@@ -20,6 +20,10 @@
 
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
+
+#include <net/sock.h>
+#include <net/mptcp.h>
+#include <net/tcp.h>
 
 typedef ssize_t (*io_fn_t)(struct file *, char __user *, size_t, loff_t *);
 typedef ssize_t (*iter_fn_t)(struct kiocb *, struct iov_iter *);
@@ -623,7 +627,7 @@ SYSCALL_DEFINE4(pwrite64, unsigned int, fd, const char __user *, buf,
 	f = fdget(fd);
 	if (f.file) {
 		ret = -ESPIPE;
-		if (f.file->f_mode & FMODE_PWRITE)  
+		if (f.file->f_mode & FMODE_PWRITE)
 			ret = vfs_write(f.file, buf, count, &pos);
 		fdput(f);
 	}
@@ -1223,6 +1227,22 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
 	if (in.file->f_flags & O_NONBLOCK)
 		fl = SPLICE_F_NONBLOCK;
 #endif
+	if(out_inode->i_mode & S_IFSOCK){
+		struct socket *socket = SOCKET_I(out_inode);
+		struct sock *sk = socket->sk;
+		if(sk->sk_type == SOCK_STREAM
+				&& sk->sk_protocol == IPPROTO_TCP
+				&& mptcp(tcp_sk(sk))){
+			struct tcp_sock *tp = tcp_sk(sk);
+			if(tp->mpcb->sched_ops->push_info){
+				tp->mpcb->sched_ops->push_info(sk,
+						MPTCP_DATA_SIZE, &count);
+			}
+			/* Passer l'info au schedd */
+			/* ! Detecter si c'est le bon sched etc */
+		}
+	}
+
 	file_start_write(out.file);
 	retval = do_splice_direct(in.file, &pos, out.file, &out_pos, count, fl);
 	file_end_write(out.file);

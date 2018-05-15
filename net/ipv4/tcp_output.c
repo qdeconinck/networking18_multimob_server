@@ -82,6 +82,7 @@ void tcp_event_new_data_sent(struct sock *sk, const struct sk_buff *skb)
 	tp->snd_nxt = TCP_SKB_CB(skb)->end_seq;
 
 	tp->packets_out += tcp_skb_pcount(skb);
+	tp->snd_packets += tcp_skb_pcount(skb);
 	if (!prior_packets || icsk->icsk_pending == ICSK_TIME_EARLY_RETRANS ||
 	    icsk->icsk_pending == ICSK_TIME_LOSS_PROBE) {
 		tcp_rearm_rto(sk);
@@ -149,7 +150,6 @@ static void tcp_cwnd_restart(struct sock *sk, const struct dst_entry *dst)
 	u32 cwnd = tp->snd_cwnd;
 
 	tcp_ca_event(sk, CA_EVENT_CWND_RESTART);
-
 	tp->snd_ssthresh = tcp_current_ssthresh(sk);
 	restart_cwnd = min(restart_cwnd, cwnd);
 
@@ -592,7 +592,7 @@ static unsigned int tcp_syn_options(struct sock *sk, struct sk_buff *skb,
 			remaining -= TCPOLEN_SACKPERM_ALIGNED;
 	}
 	if (tp->request_mptcp || mptcp(tp))
-		mptcp_syn_options(sk, opts, &remaining);
+		mptcp_syn_options(sk, skb, opts, &remaining);
 
 	if (fastopen && fastopen->cookie.len >= 0) {
 		u32 need = fastopen->cookie.len;
@@ -1517,6 +1517,7 @@ static void tcp_cwnd_application_limited(struct sock *sk)
 	}
 	tp->snd_cwnd_stamp = tcp_time_stamp;
 }
+
 
 void tcp_cwnd_validate(struct sock *sk, bool is_cwnd_limited)
 {
@@ -3217,6 +3218,41 @@ static void tcp_connect_queue_skb(struct sock *sk, struct sk_buff *skb)
 	sk_mem_charge(sk, skb->truesize);
 	tp->write_seq = tcb->end_seq;
 	tp->packets_out += tcp_skb_pcount(skb);
+	tp->snd_packets += tcp_skb_pcount(skb);
+}
+
+/* Returns the next segment to be sent from the mptcp meta-queue.
+ * (chooses the reinject queue if any segment is waiting in it, otherwise,
+ * chooses the normal write queue).
+ * Sets *@reinject to 1 if the returned segment comes from the
+ * reinject queue. Sets it to 0 if it is the regular send-head of the meta-sk,
+ * and sets it to -1 if it is a meta-level retransmission to optimize the
+ * receive-buffer.
+ */
+static struct sk_buff *__mptcp_next_segment(struct sock *meta_sk, int *reinject)
+{
+	const struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
+	struct sk_buff *skb = NULL;
+
+	*reinject = 0;
+
+	/* If we are in fallback-mode, just take
+	 * from the meta-send-queue */
+	if (mpcb->infinite_mapping_snd || mpcb->send_infinite_mapping)
+		return tcp_send_head(meta_sk);
+
+	skb = skb_peek(&mpcb->reinject_queue);
+
+	if (skb) {
+		*reinject = 1;
+	} else {
+		skb = tcp_send_head(meta_sk);
+		if (!skb)
+			skb = tcp_write_queue_head(meta_sk);
+		if (!skb && mpcb->master_sk)
+			skb = tcp_write_queue_head(mpcb->master_sk);
+	}
+	return skb;
 }
 
 /* Build and send a SYN with data and (cached) Fast Open cookie. However,
@@ -3226,29 +3262,31 @@ static void tcp_connect_queue_skb(struct sock *sk, struct sk_buff *skb)
  * If cookie is not cached or other error occurs, falls back to send a
  * regular SYN with Fast Open cookie request option.
  */
-static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn)
+static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn,
+			     bool mptcp_fastjoinout)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_fastopen_request *fo = tp->fastopen_req;
 	int syn_loss = 0, space, err = 0, copied;
 	unsigned long last_syn_loss = 0;
-	struct sk_buff *syn_data;
+	struct sk_buff *syn_data, *mptcp_syn_data;
 
 	tp->rx_opt.mss_clamp = tp->advmss;  /* If MSS is not cached */
-	tcp_fastopen_cache_get(sk, &tp->rx_opt.mss_clamp, &fo->cookie,
+	if (!mptcp_fastjoinout) {
+		tcp_fastopen_cache_get(sk, &tp->rx_opt.mss_clamp, &fo->cookie,
 			       &syn_loss, &last_syn_loss);
-	/* Recurring FO SYN losses: revert to regular handshake temporarily */
-	if (syn_loss > 1 &&
-	    time_before(jiffies, last_syn_loss + (60*HZ << syn_loss))) {
-		fo->cookie.len = -1;
-		goto fallback;
+		/* Recurring FO SYN losses: revert to regular handshake temporarily */
+		if (syn_loss > 1 &&
+			time_before(jiffies, last_syn_loss + (60*HZ << syn_loss))) {
+			fo->cookie.len = -1;
+			goto fallback;
+		}
+
+		if (sysctl_tcp_fastopen & TFO_CLIENT_NO_COOKIE)
+			fo->cookie.len = -1;
+		else if (fo->cookie.len <= 0)
+			goto fallback;
 	}
-
-	if (sysctl_tcp_fastopen & TFO_CLIENT_NO_COOKIE)
-		fo->cookie.len = -1;
-	else if (fo->cookie.len <= 0)
-		goto fallback;
-
 	/* MSS for SYN-data is based on cached MSS and bounded by PMTU and
 	 * user-MSS. Reserve maximum option space for middleboxes that add
 	 * private TCP options. The cost is reduced data space in SYN :(
@@ -3258,7 +3296,16 @@ static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn)
 	space = __tcp_mtu_to_mss(sk, inet_csk(sk)->icsk_pmtu_cookie) -
 		MAX_TCP_OPTION_SPACE;
 
-	space = min_t(size_t, space, fo->size);
+	if (mptcp_fastjoinout) {
+		int reinject;
+		mptcp_syn_data = __mptcp_next_segment(mptcp_meta_sk(sk),
+						      &reinject);
+		if (!mptcp_syn_data)
+			goto fallback;
+		space = min_t(size_t, space, mptcp_syn_data->len);
+
+	} else
+		space = min_t(size_t, space, fo->size);
 
 	/* limit to order-0 allocations */
 	space = min_t(size_t, space, SKB_MAX_HEAD(MAX_TCP_HEADER));
@@ -3268,21 +3315,33 @@ static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn)
 		goto fallback;
 	syn_data->ip_summed = CHECKSUM_PARTIAL;
 	memcpy(syn_data->cb, syn->cb, sizeof(syn->cb));
-	copied = copy_from_iter(skb_put(syn_data, space), space,
-				&fo->data->msg_iter);
-	if (unlikely(!copied)) {
-		kfree_skb(syn_data);
-		goto fallback;
-	}
-	if (copied != space) {
-		skb_trim(syn_data, copied);
-		space = copied;
-	}
+	if (mptcp_fastjoinout) {
+		skb_copy_bits(mptcp_syn_data, 0, skb_put(syn_data, space), space);
+		/* Keep the link with MPTCP data seq */
+		TCP_SKB_CB(syn_data)->mptcp_seqs[0] = TCP_SKB_CB(mptcp_syn_data)->seq;
+		TCP_SKB_CB(syn_data)->mptcp_seqs[1] = TCP_SKB_CB(mptcp_syn_data)->end_seq;
+		if (syn_data->len > space) {
+			skb_trim(syn_data, space);
+			TCP_SKB_CB(mptcp_syn_data)->end_seq = TCP_SKB_CB(mptcp_syn_data)->seq + space;
+			TCP_SKB_CB(syn_data)->mptcp_seqs[1] = TCP_SKB_CB(syn_data)->mptcp_seqs[0] + space;
+		}
+	} else {
+		copied = copy_from_iter(skb_put(syn_data, space), space,
+					&fo->data->msg_iter);
+		if (unlikely(!copied)) {
+			kfree_skb(syn_data);
+			goto fallback;
+		}
+		if (copied != space) {
+			skb_trim(syn_data, copied);
+			space = copied;
+		}
 
-	/* No more data pending in inet_wait_for_connect() */
-	if (space == fo->size)
-		fo->data = NULL;
-	fo->copied = space;
+		/* No more data pending in inet_wait_for_connect() */
+		if (space == fo->size)
+			fo->data = NULL;
+		fo->copied = space;
+	}
 
 	tcp_connect_queue_skb(sk, syn_data);
 
@@ -3298,20 +3357,28 @@ static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn)
 	TCP_SKB_CB(syn_data)->seq++;
 	TCP_SKB_CB(syn_data)->tcp_flags = TCPHDR_ACK | TCPHDR_PSH;
 	if (!err) {
-		tp->syn_data = (fo->copied > 0);
+		if (!mptcp_fastjoinout)
+			tp->syn_data = (fo->copied > 0);
+		tp->snd_packets += 1;
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPORIGDATASENT);
 		goto done;
 	}
 
 fallback:
 	/* Send a regular SYN with Fast Open cookie request option */
-	if (fo->cookie.len > 0)
+	if (!mptcp_fastjoinout && fo->cookie.len > 0)
 		fo->cookie.len = 0;
+	if (mptcp_fastjoinout) {
+		/* Transform the fast join out in fast join in */
+		TCP_SKB_CB(syn)->mptcp_control_flags &= ~MPTCPHDR_FAST_JOIN_OUT;
+		TCP_SKB_CB(syn)->mptcp_control_flags |= MPTCPHDR_FAST_JOIN_IN;
+	}
 	err = tcp_transmit_skb(sk, syn, 1, sk->sk_allocation);
 	if (err)
 		tp->syn_fastopen = 0;
 done:
-	fo->cookie.len = -1;  /* Exclude Fast Open option for SYN retries */
+	if (!mptcp_fastjoinout)
+		fo->cookie.len = -1;  /* Exclude Fast Open option for SYN retries */
 	return err;
 }
 
@@ -3338,9 +3405,17 @@ int tcp_connect(struct sock *sk)
 	tcp_connect_queue_skb(sk, buff);
 	tcp_ecn_send_syn(sk, buff);
 
+        if (mptcp(tp) && tp->mpcb->request_fast_join == MPTCPHDR_FAST_JOIN_IN)
+                TCP_SKB_CB(buff)->mptcp_control_flags |= MPTCPHDR_FAST_JOIN_IN;
+
+	if (mptcp(tp) && tp->mpcb->request_fast_join == MPTCPHDR_FAST_JOIN_OUT)
+		TCP_SKB_CB(buff)->mptcp_control_flags |= MPTCPHDR_FAST_JOIN_OUT;
+
 	/* Send off SYN; include data in Fast Open. */
-	err = tp->fastopen_req ? tcp_send_syn_data(sk, buff) :
-	      tcp_transmit_skb(sk, buff, 1, sk->sk_allocation);
+	err = tp->fastopen_req ? tcp_send_syn_data(sk, buff, false) :
+		(TCP_SKB_CB(buff)->mptcp_control_flags & MPTCPHDR_FAST_JOIN_OUT) ?
+		tcp_send_syn_data(sk, buff, true) :
+		tcp_transmit_skb(sk, buff, 1, sk->sk_allocation);
 	if (err == -ECONNREFUSED)
 		return err;
 
@@ -3350,6 +3425,19 @@ int tcp_connect(struct sock *sk)
 	tp->snd_nxt = tp->write_seq;
 	tp->pushed_seq = tp->write_seq;
 	TCP_INC_STATS(sock_net(sk), TCP_MIB_ACTIVEOPENS);
+
+	/* Wait for a complete connection to reset the fast join request */
+	if (mptcp(tp) && tp->mpcb->request_fast_join)
+		tp->mpcb->request_fast_join = 0;
+
+#ifdef CONFIG_MPTCP_ORACLE
+	/* TODO count here attempts to connect to a given path */
+	/* When a MPTCP subflow is newly created by the initiating host, the
+	 * device associated is not known yet by the oracle. Make it aware of it
+	 * now.
+	 */
+	mptcp_oracle_add_dev_to_entry(sk, tp->oracle_entry, tp->oracle_tp_entry);
+#endif
 
 	/* Timer for repeating the SYN until an answer. */
 	inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,

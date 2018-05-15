@@ -351,6 +351,13 @@ static struct ctl_table ipv4_table[] = {
 		.proc_handler	= proc_dointvec_jiffies,
 	},
 	{
+		.procname	= "tcp_keepalive_intvl_ms",
+		.data		= &sysctl_tcp_keepalive_intvl_ms,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_jiffies,
+	},
+	{
 		.procname	= "tcp_retries1",
 		.data		= &sysctl_tcp_retries1,
 		.maxlen		= sizeof(int),
@@ -361,6 +368,13 @@ static struct ctl_table ipv4_table[] = {
 	{
 		.procname	= "tcp_retries2",
 		.data		= &sysctl_tcp_retries2,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec
+	},
+	{
+		.procname	= "tcp_retries3",
+		.data		= &sysctl_tcp_retries3,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec

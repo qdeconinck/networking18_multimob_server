@@ -95,25 +95,39 @@ struct tcp_out_options {
 
 		struct {
 			__u64	sender_truncated_mac;
+			__u32	sender_truncated_mac_32;
+			__u32	data_number; /* Either Data ACK or DSN */
 			__u32	sender_nonce;
 					/* random number of the sender */
 			__u32	token;	/* token for mptcp */
-			u8	low_prio:1;
+			u8	low_prio:1,
+				from_server:1;
 		} mp_join_syns;
 	};
 
 	struct {
 		struct in_addr addr;
 		u8 addr_id;
+		u16 port;
 	} add_addr4;
 
 	struct {
 		struct in6_addr addr;
 		u8 addr_id;
+		u16 port;
 	} add_addr6;
 
 	u16	remove_addrs;	/* list of address id */
 	u8	addr_id;	/* address id (mp_join or add_address) */
+	u32	opaque_len;
+	//FIXME use the define, need to find the right place for the define.
+	u8	opaque_data[5];
+	u16	mp_info_val;	/* What is the subtype of MP_INFO? */
+	u8	snd_loc_id;	/* Used for connectivity option */
+	u8	snd_rem_id;	/* Used for connectivity option */
+	u32	snd_srtt_us;	/* Used for rtt option */
+	u32	snd_rttvar_us;	/* Used for rtt option */
+	u32	snd_rto_us;	/* Used for rto option */
 #endif /* CONFIG_MPTCP */
 };
 
@@ -401,12 +415,28 @@ struct tcp_sock {
 		was_meta_sk:1,	/* This was a meta sk (in case of reuse) */
 		is_master_sk,
 		close_it:1,	/* Must close socket in mptcp_data_ready? */
-		closing:1;
+		closing:1,
+		wait_first_ack:1, /* Compute RTT for server */
+		high_rto:1, /* Is it a high RTO subflow? */
+		was_bad:1; /* Was this subflow ever declared bad before? */
 	struct mptcp_tcp_sock *mptcp;
+	/* RTT information given by the remote host */
+	u32		rem_srtt_us;
+	u32		rem_rttvar_us;
+	/* RTO information given by the remote host */
+	u32		rem_rto_us;
+	u32		cnt_bytes_rtt_req;
+	u32		snd_packets; /* Total number of packets sent */
+	u32		synack_stamp;
 #ifdef CONFIG_MPTCP
 	struct hlist_nulls_node tk_table;
 	u32		mptcp_loc_token;
+	u32		mptcp_new_last_tstamp; /* Last timestamp of new (non-reinjected) DATA SEQ or DATA ACK */
 	u64		mptcp_loc_key;
+#ifdef CONFIG_MPTCP_ORACLE
+	struct mptcp_oracle_entry *oracle_entry; /* Quick way to access to the oracle entry */
+	struct tcp_sk_entry *oracle_tp_entry; /* Quick way to delete the entry */
+#endif /* CONFIG_MPTCP_ORACLE */
 #endif /* CONFIG_MPTCP */
 };
 

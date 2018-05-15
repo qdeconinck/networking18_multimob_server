@@ -139,9 +139,7 @@ static int mptcp_v4_join_init_req(struct request_sock *req, struct sock *sk,
 	mtreq->loc_id = loc_id;
 	mtreq->low_prio = low_prio;
 
-	mptcp_join_reqsk_init(mpcb, req, skb);
-
-	return 0;
+	return mptcp_join_reqsk_init(mpcb, req, sk, skb);
 }
 
 /* Similar to tcp_request_sock_ops */
@@ -172,7 +170,7 @@ static void mptcp_v4_reqsk_queue_hash_add(struct sock *meta_sk,
 }
 
 /* Similar to tcp_v4_conn_request */
-static int mptcp_v4_join_request(struct sock *meta_sk, struct sk_buff *skb)
+int mptcp_v4_join_request(struct sock *meta_sk, struct sk_buff *skb)
 {
 	return tcp_conn_request(&mptcp_request_sock_ops,
 				&mptcp_join_request_sock_ipv4_ops,
@@ -186,7 +184,9 @@ int mptcp_v4_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
 	struct sock *child, *rsk = NULL;
 	int ret;
 
-	if (!(TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_JOIN)) {
+	if (!(TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_JOIN)
+			&& !(TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_FAST_JOIN_IN)
+			&& !(TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_FAST_JOIN_OUT)) {
 		struct tcphdr *th = tcp_hdr(skb);
 		const struct iphdr *iph = ip_hdr(skb);
 		struct sock *sk;
@@ -242,6 +242,23 @@ int mptcp_v4_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
 		 * by the user.
 		 */
 		ret = tcp_rcv_state_process(child, skb, tcp_hdr(skb), skb->len);
+		if (is_fastjoin_out_syn(tcp_sk(child), skb)) {
+			/* Only process the data if it should be accepted! */
+			if (mpcb->accept_data) {
+				/* Well, a SYN packet in TCP consumes 1 byte; however
+				 * once the connection established, except for the
+				 * DATA FIN, MPTCP does not expect to have "ghost"
+				 * bytes; now that the connection is in established
+				 * state, let's increase by one the seq of the skb
+				 */
+				TCP_SKB_CB(skb)->seq += 1;
+				/* Now actually receive the data contained in the SYN packet */
+				tcp_rcv_established(child, skb, tcp_hdr(skb), skb->len);
+			} else {
+				/* Don't forget then to wait for higher acks */
+				tcp_rcv_nxt_update(tcp_sk(child), TCP_SKB_CB(skb)->end_seq);
+			}
+		}
 		bh_unlock_sock(child);
 		sock_put(child);
 		if (ret) {
@@ -338,6 +355,7 @@ int mptcp_init4_subsockets(struct sock *meta_sk, const struct mptcp_loc4 *loc,
 	struct sockaddr_in loc_in, rem_in;
 	struct socket sock;
 	int ret;
+	struct mptcp_cb *mpcb	= tcp_sk(meta_sk)->mpcb;
 
 	/** First, create and prepare the new socket */
 
@@ -405,6 +423,8 @@ int mptcp_init4_subsockets(struct sock *meta_sk, const struct mptcp_loc4 *loc,
 	}
 
 	MPTCP_INC_STATS(sock_net(meta_sk), MPTCP_MIB_JOINSYNTX);
+
+	mpcb->event_init_bits |= (1 << tp->mptcp->path_index);
 
 	sk_set_socket(sk, meta_sk->sk_socket);
 	sk->sk_wq = meta_sk->sk_wq;

@@ -114,6 +114,71 @@ enum {
 #define TCP_NOTSENT_LOWAT	25	/* limit number of unsent bytes in write queue */
 #define TCP_CC_INFO		26	/* Get Congestion Control (optional) info */
 #define MPTCP_ENABLED		42
+#define MPTCP_OPT_DELAY		43
+#define MPTCP_ALLOW_BUP		44
+
+/* MPTCP API */
+
+#define MPTCP_GET_SUB_IDS	66	/* Get subflows ids */
+#define MPTCP_CLOSE_SUB_ID	67	/* Close sub id */
+#define MPTCP_GET_SUB_TUPLE	68	/* Get sub tuple */
+#define MPTCP_OPEN_SUB_TUPLE	69	/* Open sub tuple */
+#define MPTCP_GET_SUB_INFO	70	/* Get sub info */
+
+#define MPTCP_SUB_GETSOCKOPT	71	/* Get sockopt for a specific sub */
+#define MPTCP_SUB_SETSOCKOPT	72	/* Set sockopt for a specific sub */
+
+/* MPTCP API : cmsg */
+
+#define MPTCP_EV_INIT_SUB	1	/* New subflow init */
+#define MPTCP_EV_DEL_SUB	2	/* Subflow deleted */
+
+struct mptcp_event_sub_init {
+	__u8		id;
+};
+
+struct mptcp_event_sub_del {
+	__u8		id;
+};
+
+struct mptcp_sub_setsockopt {
+	__u8		id;
+	int		level;
+	int		optname;
+	char __user	*optval;
+	unsigned int	optlen;
+};
+
+struct mptcp_sub_getsockopt {
+	__u8		id;
+	int		level;
+	int		optname;
+	char __user	*optval;
+	unsigned int __user	*optlen;
+};
+
+struct mptcp_sub_tuple {
+	__u8	id;
+	__u8	addrs[0];
+};
+
+struct mptcp_sub_status {
+	__u8 	id;
+	__u16	slave_sk:1,
+		fully_established:1,
+		attached:1,
+		low_prio:1,
+		pre_established:1;
+};
+
+struct mptcp_sub_ids {
+	__u8 			sub_count;
+	struct mptcp_sub_status sub_status[];
+};
+
+struct mptcp_close_sub_id {
+	__u8	id;
+};
 
 struct tcp_repair_opt {
 	__u32	opt_code;
@@ -193,6 +258,11 @@ struct tcp_info {
 	__u64	tcpi_max_pacing_rate;
 	__u64	tcpi_bytes_acked; /* RFC4898 tcpEStatsAppHCThruOctetsAcked */
 	__u64	tcpi_bytes_received; /* RFC4898 tcpEStatsAppHCThruOctetsReceived */
+};
+
+struct mptcp_sub_info {
+	__u8	id;
+	struct tcp_info info;
 };
 
 /* for TCP_MD5SIG socket option */

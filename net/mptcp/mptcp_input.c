@@ -287,6 +287,10 @@ static int mptcp_verif_dss_csum(struct sock *sk)
 	skb_queue_walk_safe(&sk->sk_receive_queue, tmp, tmp1) {
 		unsigned int csum_len;
 
+		/* There is no checksum in fast join out syn */
+		if (is_fastjoin_out_syn(tcp_sk(sk), tmp))
+			return 1;
+
 		if (before(tp->mptcp->map_subseq + tp->mptcp->map_data_len, TCP_SKB_CB(tmp)->end_seq))
 			/* Mapping ends in the middle of the packet -
 			 * csum only these bytes
@@ -633,6 +637,15 @@ static int mptcp_detect_mapping(struct sock *sk, struct sk_buff *skb)
 	ptr++;
 	data_len = get_unaligned_be16(ptr);
 
+	/* With Fast Join Out, there is no DSS option... so take the info from
+	 * the socket
+	 */
+	if (is_fastjoin_out_syn(tcp_sk(sk), skb)) {
+		data_seq = tcp_sk(sk)->mptcp->rx_opt.data_seq;
+		sub_seq = TCP_SKB_CB(skb)->seq;
+		data_len = tcp_sk(sk)->mptcp->rx_opt.data_len;
+	}
+
 	/* If it's an empty skb with DATA_FIN, sub_seq must get fixed.
 	 * The draft sets it to 0, but we really would like to have the
 	 * real value, to have an easy handling afterwards here in this
@@ -884,6 +897,7 @@ static int mptcp_queue_skb(struct sock *sk)
 	u64 rcv_nxt64 = mptcp_get_rcv_nxt_64(meta_tp);
 	u32 old_copied_seq = tp->copied_seq;
 	bool data_queued = false;
+	u8 have_bup = 0;
 
 	/* Have we not yet received the full mapping? */
 	if (!tp->mptcp->mapping_present ||
@@ -933,8 +947,12 @@ static int mptcp_queue_skb(struct sock *sk)
 		/* Seg's have to go to the meta-ofo-queue */
 		skb_queue_walk_safe(&sk->sk_receive_queue, tmp1, tmp) {
 			tp->copied_seq = TCP_SKB_CB(tmp1)->end_seq;
+			mpcb->idle_for_seq = max(TCP_SKB_CB(tmp1)->end_seq, mpcb->idle_for_seq);
 			mptcp_prepare_skb(tmp1, sk);
 			__skb_unlink(tmp1, &sk->sk_receive_queue);
+			/* This subflow sent the last new information */
+			tp->mptcp_new_last_tstamp = tcp_time_stamp;
+
 			/* MUST be done here, because fragstolen may be true later.
 			 * Then, kfree_skb_partial will not account the memory.
 			 */
@@ -953,6 +971,27 @@ static int mptcp_queue_skb(struct sock *sk)
 		tcp_enter_quickack_mode(sk);
 	} else {
 		/* Ready for the meta-rcv-queue */
+
+		/* The timers are only useful if backup subflows could be open
+		 */
+		if (!tp->mpcb->server_side && tp->mpcb->pm_ops->push_info)
+			tp->mpcb->pm_ops->push_info(meta_sk, MPTCP_HAVE_BUP, &have_bup);
+
+		if (sysctl_mptcp_active_bk && have_bup) {
+			/* Reset the receive timer if the IDLE bit is not set
+			 * Otherwise, stop the receive timer but set up the keepalive one.
+			 */
+			if (tp->mpcb->mp_idle) {
+				mptcp_stop_rcv_timer(meta_sk);
+			} else {
+				mptcp_reset_rcv_timer(meta_sk);
+			}
+		} else {
+			/* No need to run timers */
+			mptcp_stop_rcv_timer(meta_sk);
+			inet_csk_delete_keepalive_timer(meta_sk);
+		}
+
 		skb_queue_walk_safe(&sk->sk_receive_queue, tmp1, tmp) {
 			int eaten = 0;
 			bool fragstolen = false;
@@ -986,7 +1025,12 @@ static int mptcp_queue_skb(struct sock *sk)
 				eaten = tcp_queue_rcv(meta_sk, tmp1, 0, &fragstolen);
 
 			meta_tp->rcv_nxt = TCP_SKB_CB(tmp1)->end_seq;
+			if (meta_tp->rcv_nxt == mpcb->idle_for_seq) {
+				mptcp_stop_rcv_timer(meta_sk);
+			}
 			mptcp_check_rcvseq_wrap(meta_tp, old_rcv_nxt);
+			/* This subflow sent the last new information */
+			tp->mptcp_new_last_tstamp = tcp_time_stamp;
 
 			if ((TCP_SKB_CB(tmp1)->tcp_flags & TCPHDR_FIN) &&
 			    !mpcb->in_time_wait)
@@ -1071,6 +1115,9 @@ restart:
 	}
 
 exit:
+	if (tcp_sk(meta_sk)->mpcb->idle_for_seq == tcp_sk(meta_sk)->rcv_nxt) {
+		mptcp_stop_rcv_timer(meta_sk);
+	}
 	if (tcp_sk(sk)->close_it) {
 		tcp_send_ack(sk);
 		tcp_sk(sk)->ops->time_wait(sk, TCP_TIME_WAIT, 0);
@@ -1434,6 +1481,46 @@ static void mptcp_xmit_retransmit_queue(struct sock *meta_sk)
 	}
 }
 
+static void mptcp_snd_una_update(struct tcp_sock *meta_tp, struct tcp_sock *tp,
+				u32 data_ack){
+	u32 delta = data_ack - meta_tp->snd_una;
+
+	/* Has this subflow acked first new data? */
+	if (delta > 0)
+		tp->mptcp_new_last_tstamp = tcp_time_stamp;
+
+	meta_tp->bytes_acked += delta;
+	meta_tp->snd_una = data_ack;
+}
+
+static void process_mp_info(struct tcp_sock *tp)
+{
+	struct mptcp_options_received mopt = tp->mptcp->rx_opt;
+	if (mopt.mp_info_rtt) {
+		tp->rem_srtt_us = mopt.rcv_srtt_us;
+		tp->rem_rttvar_us = mopt.rcv_rttvar_us;
+	}
+	if (mopt.mp_info_conn) {
+		/* Find the related subflow and close it */
+		struct sock *sk_it, *tmpsk;
+		mptcp_for_each_sk_safe(tp->mpcb, sk_it, tmpsk) {
+			if (tcp_sk(sk_it)->mptcp->rem_id == mopt.conn_rem_id &&
+			    tcp_sk(sk_it)->mptcp->loc_id == mopt.conn_loc_id)
+			{
+				mptcp_reinject_data(sk_it, 0);
+				sk_it->sk_err = ECONNRESET;
+				if (tcp_need_reset(sk_it->sk_state))
+					tcp_sk(sk_it)->ops->send_active_reset(sk_it,
+							GFP_ATOMIC);
+				mptcp_sub_force_close(sk_it);
+			}
+		}
+	}
+	if (mopt.mp_info_rto) {
+		tp->rem_rto_us = mopt.rcv_rto_us;
+	}
+}
+
 /* Handle the DATA_ACK */
 static void mptcp_data_ack(struct sock *sk, const struct sk_buff *skb)
 {
@@ -1521,11 +1608,18 @@ static void mptcp_data_ack(struct sock *sk, const struct sk_buff *skb)
 	sk->sk_err_soft = 0;
 	inet_csk(meta_sk)->icsk_probes_out = 0;
 	meta_tp->rcv_tstamp = tcp_time_stamp;
+	if (mptcp_is_data_seq(skb))
+		tp->mpcb->mp_idle = tp->mptcp->rx_opt.mp_idle;
+	if (sysctl_mptcp_active_bk && tp->mpcb->rcv_timer_running) {
+		/* Consider connection alive if receiving a Data ACK packet */
+		mptcp_reset_rcv_timer(meta_sk);
+	}
 	prior_packets = meta_tp->packets_out;
+	/* Cope with fast join SYNs! */
 	if (!prior_packets)
 		goto no_queue;
 
-	meta_tp->snd_una = data_ack;
+	mptcp_snd_una_update(meta_tp, tp, data_ack);
 
 	mptcp_clean_rtx_queue(meta_sk, prior_snd_una);
 
@@ -1551,6 +1645,11 @@ static void mptcp_data_ack(struct sock *sk, const struct sk_buff *skb)
 	if (meta_sk->sk_state != TCP_ESTABLISHED &&
 	    mptcp_rcv_state_process(meta_sk, sk, skb, data_seq, data_len))
 		return;
+
+	process_mp_info(tp);
+	if (tp->mptcp->rx_opt.requested_rtt) {
+		tp->mptcp->send_rto = 1;
+	}
 
 exit:
 	mptcp_push_pending_frames(meta_sk);
@@ -1592,7 +1691,10 @@ static void mptcp_send_reset_rem_id(const struct mptcp_cb *mpcb, u8 rem_id)
 	struct sock *sk_it, *tmpsk;
 
 	mptcp_for_each_sk_safe(mpcb, sk_it, tmpsk) {
-		if (tcp_sk(sk_it)->mptcp->rem_id == rem_id) {
+		if ((tcp_sk(sk_it)->mptcp->rem_id &&
+		tcp_sk(sk_it)->mptcp->rem_id == rem_id) ||
+		(!tcp_sk(sk_it)->mptcp->rem_id &&
+		tcp_sk(sk_it)->mptcp->rx_opt.rem_id == rem_id)) {
 			mptcp_reinject_data(sk_it, 0);
 			sk_it->sk_err = ECONNRESET;
 			if (tcp_need_reset(sk_it->sk_state))
@@ -1612,6 +1714,9 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 	/* If the socket is mp-capable we would have a mopt. */
 	if (!mopt)
 		return;
+
+	/* XXX Have to force this to avoid very strange bugs... */
+	mopt->is_fast_join = 0;
 
 	switch (mp_opt->sub) {
 	case MPTCP_SUB_CAPABLE:
@@ -1671,6 +1776,7 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 		case MPTCP_SUB_LEN_JOIN_SYN:
 			mopt->is_mp_join = 1;
 			mopt->saw_mpc = 1;
+			mopt->is_fast_join = 0;
 			mopt->low_prio = mpjoin->b;
 			mopt->rem_id = mpjoin->addr_id;
 			mopt->mptcp_rem_token = mpjoin->u.syn.token;
@@ -1678,6 +1784,7 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 			break;
 		case MPTCP_SUB_LEN_JOIN_SYNACK:
 			mopt->saw_mpc = 1;
+			mopt->is_fast_join = 0;
 			mopt->low_prio = mpjoin->b;
 			mopt->rem_id = mpjoin->addr_id;
 			mopt->mptcp_recv_tmac = mpjoin->u.synack.mac;
@@ -1685,6 +1792,7 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 			break;
 		case MPTCP_SUB_LEN_JOIN_ACK:
 			mopt->saw_mpc = 1;
+			mopt->is_fast_join = 0;
 			mopt->join_ack = 1;
 			memcpy(mopt->mptcp_recv_mac, mpjoin->u.ack.mac, 20);
 			break;
@@ -1722,6 +1830,9 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 				mopt->data_ack = get_unaligned_be32(ptr);
 				ptr += MPTCP_SUB_LEN_ACK;
 			}
+
+			/* Does the remote request the sender RTT? */
+			mopt->requested_rtt = mdss->r;
 		}
 
 		tcb->dss_off = (ptr - skb_transport_header(skb));
@@ -1741,6 +1852,9 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 			mopt->data_len = get_unaligned_be16(ptr);
 
 			tcb->mptcp_flags |= MPTCPHDR_SEQ;
+
+			/* Is the connection idle? */
+			mopt->mp_idle = mdss->I;
 
 			/* Is a check-sum present? */
 			if (opsize == mptcp_sub_len_dss(mdss, 1))
@@ -1794,6 +1908,15 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 		mopt->saw_rem_addr = 1;
 		mopt->rem_addr_ptr = ptr;
 		break;
+	case MPTCP_SUB_OPAQUE:
+		if((opsize - MPTCP_SUB_LEN_OPAQUE) < 0){
+			mptcp_debug("%s: mp_opaque: bad option size %d\n",
+				    __func__, opsize);
+			break;
+		}
+		mopt->saw_opaque = 1;
+		mopt->opaque_ptr = ptr;
+		break;
 	case MPTCP_SUB_PRIO:
 	{
 		const struct mp_prio *mpprio = (struct mp_prio *)ptr;
@@ -1833,6 +1956,113 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 		mopt->mptcp_sender_key = ((struct mp_fclose *)ptr)->key;
 
 		break;
+	case MPTCP_SUB_FAST_JOIN_IN:
+	{
+		const struct mp_fast_join_in *mpfji = (struct mp_fast_join_in *)ptr;
+		struct tcp_skb_cb *tcb = TCP_SKB_CB(skb);
+
+		if (opsize != MPTCP_SUB_LEN_FAST_JOIN_IN_SYN &&
+				opsize != MPTCP_SUB_LEN_FAST_JOIN_IN_SYNACK) {
+			mptcp_debug("%s: mp_fast_join_in: bad option size %d\n",
+				__func__, opsize);
+			break;
+		}
+
+		switch (opsize) {
+		case MPTCP_SUB_LEN_FAST_JOIN_IN_SYN:
+			mopt->is_mp_join = 1;
+			mopt->saw_mpc = 1;
+			mopt->is_fast_join = MPTCPHDR_FAST_JOIN_IN;
+			mopt->low_prio = mpfji->b;
+			mopt->from_server = mpfji->from_server;
+			mopt->rem_id = mpfji->addr_id;
+			mopt->mptcp_rem_token = mpfji->u.syn.token;
+			mopt->data_ack = mpfji->u.syn.data_ack;
+			mopt->mptcp_recv_tmac = mpfji->u.syn.mac;
+			tcb->mptcp_control_flags |= MPTCPHDR_FAST_JOIN_IN;
+			break;
+		case MPTCP_SUB_LEN_FAST_JOIN_IN_SYNACK:
+			mopt->saw_mpc = 1;
+			mopt->is_fast_join = MPTCPHDR_FAST_JOIN_IN;
+			mopt->low_prio = mpfji->b;
+			mopt->rem_id = mpfji->addr_id;
+			mopt->mptcp_recv_tmac = mpfji->u.synack.mac;
+			mopt->data_seq = mpfji->u.synack.data_seq;
+			tcb->mptcp_control_flags |= MPTCPHDR_FAST_JOIN_IN;
+			break;
+		}
+		break;
+	}
+	case MPTCP_SUB_FAST_JOIN_OUT:
+	{
+		const struct mp_fast_join_out *mpfjo = (struct mp_fast_join_out *)ptr;
+		struct tcp_skb_cb *tcb = TCP_SKB_CB(skb);
+
+		if (opsize != MPTCP_SUB_LEN_FAST_JOIN_OUT_SYN &&
+		    opsize != MPTCP_SUB_LEN_FAST_JOIN_OUT_SYNACK) {
+			mptcp_debug("%s: mp_fast_join_out: bad option size %d\n",
+				__func__, opsize);
+			break;
+		}
+
+		switch (opsize) {
+		case MPTCP_SUB_LEN_FAST_JOIN_OUT_SYN:
+			mopt->is_mp_join = 1;
+			mopt->saw_mpc = 1;
+			mopt->is_fast_join = MPTCPHDR_FAST_JOIN_OUT;
+			mopt->low_prio = mpfjo->b;
+			mopt->from_server = mpfjo->from_server;
+			mopt->rem_id = mpfjo->addr_id;
+			mopt->mptcp_rem_token = mpfjo->u.syn.token;
+			mopt->data_seq = mpfjo->u.syn.data_seq;
+			mopt->mptcp_recv_tmac_32 = mpfjo->u.syn.mac;
+			mopt->data_len = ntohs(mpfjo->u.syn.data_len);
+			tcb->mptcp_control_flags |= MPTCPHDR_FAST_JOIN_OUT;
+			/* To be accepted as a mptcp data seq, we need to
+			 * specify it explicitly
+			 */
+			tcb->mptcp_flags |= MPTCPHDR_SEQ;
+			break;
+		case MPTCP_SUB_LEN_FAST_JOIN_OUT_SYNACK:
+			mopt->saw_mpc = 1;
+			mopt->is_fast_join = MPTCPHDR_FAST_JOIN_OUT;
+			mopt->low_prio = mpfjo->b;
+			mopt->rem_id = mpfjo->addr_id;
+			mopt->mptcp_recv_tmac = mpfjo->u.synack.mac;
+			mopt->data_ack = mpfjo->u.synack.data_ack;
+			tcb->mptcp_control_flags |= MPTCPHDR_FAST_JOIN_OUT;
+			/* Trick the skb in order to be able to update the
+			 * DATA ACK (in fact it's a special SYN/ACK that
+			 * has a DATA ACK)
+			 */
+			tcb->mptcp_flags |= MPTCPHDR_ACK;
+			break;
+		}
+
+		break;
+	}
+	case MPTCP_SUB_INFO:
+	{
+		const struct mp_info *mpinfo = (struct mp_info *)ptr;
+
+		switch (mpinfo->val) {
+		case MPTCP_SUB_INFO_RTT:
+			mopt->mp_info_rtt = 1;
+			mopt->rcv_srtt_us = mpinfo->u.rtt.srtt_us;
+			mopt->rcv_rttvar_us = mpinfo->u.rtt.rttvar_us;
+			break;
+		case MPTCP_SUB_INFO_CONNECTIVITY:
+			mopt->mp_info_conn = 1;
+			mopt->conn_loc_id = mpinfo->u.conn.snd_rem_id;
+			mopt->conn_rem_id = mpinfo->u.conn.snd_loc_id;
+			break;
+		case MPTCP_SUB_INFO_RTO:
+			mopt->mp_info_rto = 1;
+			mopt->rcv_rto_us = mpinfo->u.rto.rto_us;
+			break;
+		}
+		break;
+	}
 	default:
 		mptcp_debug("%s: Received unkown subtype: %d\n",
 			    __func__, mp_opt->sub);
@@ -1942,6 +2172,18 @@ static void mptcp_handle_rem_addr(const unsigned char *ptr, struct sock *sk)
 	}
 
 	MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_REMADDRRX);
+}
+
+static void mptcp_handle_opaque(const unsigned char *ptr, struct sock *sk)
+{
+	struct mp_opaque *mpo = (struct mp_opaque *)ptr;
+	struct mptcp_cb *mpcb = tcp_sk(sk)->mpcb;
+	uint32_t len;
+
+	len = mpo->len - MPTCP_SUB_LEN_OPAQUE + 1;
+
+	if (mpcb->pm_ops->opaque)
+		mpcb->pm_ops->opaque(sk, &mpo->data, len);
 }
 
 static void mptcp_parse_addropt(const struct sk_buff *skb, struct sock *sk)
@@ -2116,6 +2358,10 @@ int mptcp_handle_options(struct sock *sk, const struct tcphdr *th,
 		mopt->more_rem_addr = 0;
 		mopt->saw_rem_addr = 0;
 	}
+	if (mopt->saw_opaque) {
+		mptcp_handle_opaque(mopt->opaque_ptr, sk);
+		mopt->saw_opaque = 0;
+	}
 	if (mopt->saw_low_prio) {
 		if (mopt->saw_low_prio == 1) {
 			tp->mptcp->rcv_low_prio = mopt->low_prio;
@@ -2214,34 +2460,75 @@ int mptcp_rcv_synsent_state_process(struct sock *sk, struct sock **skptr,
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
+	// TODO somewhere here, need to check hmac from SYN/ACK
+
 	if (mptcp(tp)) {
 		u8 hash_mac_check[20];
 		struct mptcp_cb *mpcb = tp->mpcb;
 
-		mptcp_hmac_sha1((u8 *)&mpcb->mptcp_rem_key,
+		if (tp->mptcp->rx_opt.is_fast_join & MPTCPHDR_FAST_JOIN_IN) {
+			mptcp_hmac_sha1((u8 *)&mpcb->mptcp_rem_key,
+					(u8 *)&mpcb->mptcp_loc_key,
+					(u8 *)&tp->mptcp->rx_opt.data_seq,
+					(u8 *)&tp->mptcp->sent_data_ack,
+					(u32 *)hash_mac_check);
+			if (memcmp(hash_mac_check,
+				   (char *)&(tp->mptcp->rx_opt.mptcp_recv_tmac), 8)) {
+				return 1;
+			}
+
+			/* Since it is fast join, don't wait for a fouth ACK to
+			 * send packets
+			 */
+			tp->mptcp->pre_established = 0;
+		} else if (tp->mptcp->rx_opt.is_fast_join & MPTCPHDR_FAST_JOIN_OUT) {
+			mptcp_hmac_sha1((u8 *)&mpcb->mptcp_rem_key,
+					(u8 *)&mpcb->mptcp_loc_key,
+					(u8 *)&tp->mptcp->rx_opt.data_ack,
+					(u8 *)&tp->mptcp->sent_data_seq,
+					(u32 *)hash_mac_check);
+			if (memcmp(hash_mac_check,
+				   (char *)&(tp->mptcp->rx_opt.mptcp_recv_tmac), 8)) {
+				return 1;
+			}
+			/* Since it is fast join, don't wait for a fouth ACK to
+			 * send packets
+			 */
+			tp->mptcp->pre_established = 0;
+			/* Trick the skb in order to be able to update the
+			 * DATA ACK (in fact it's a special SYN/ACK that
+			 * has a DATA ACK)
+			 */
+			TCP_SKB_CB(skb)->mptcp_flags |= MPTCPHDR_ACK;
+			/* Update the data ack */
+			mptcp_data_ack(sk, skb);
+		} else {
+			mptcp_hmac_sha1((u8 *)&mpcb->mptcp_rem_key,
 				(u8 *)&mpcb->mptcp_loc_key,
 				(u8 *)&tp->mptcp->rx_opt.mptcp_recv_nonce,
 				(u8 *)&tp->mptcp->mptcp_loc_nonce,
 				(u32 *)hash_mac_check);
-		if (memcmp(hash_mac_check,
-			   (char *)&tp->mptcp->rx_opt.mptcp_recv_tmac, 8)) {
-			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_JOINSYNACKMAC);
-			mptcp_sub_force_close(sk);
-			return 1;
-		}
+			if (memcmp(hash_mac_check,
+				(char *)&tp->mptcp->rx_opt.mptcp_recv_tmac, 8)) {
+				MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_JOINSYNACKMAC);
+				mptcp_sub_force_close(sk);
+				return 1;
+			}
 
-		/* Set this flag in order to postpone data sending
-		 * until the 4th ack arrives.
-		 */
-		tp->mptcp->pre_established = 1;
-		tp->mptcp->rcv_low_prio = tp->mptcp->rx_opt.low_prio;
+			/* Set this flag in order to postpone data sending
+			 * until the 4th ack arrives.
+			 */
+			tp->mptcp->pre_established = 1;
+			tp->mptcp->rcv_low_prio = tp->mptcp->rx_opt.low_prio;
 
-		mptcp_hmac_sha1((u8 *)&mpcb->mptcp_loc_key,
+			mptcp_hmac_sha1((u8 *)&mpcb->mptcp_loc_key,
 				(u8 *)&mpcb->mptcp_rem_key,
 				(u8 *)&tp->mptcp->mptcp_loc_nonce,
 				(u8 *)&tp->mptcp->rx_opt.mptcp_recv_nonce,
 				(u32 *)&tp->mptcp->sender_mac[0]);
+		}
 
+		tp->mptcp->rcv_low_prio = tp->mptcp->rx_opt.low_prio;
 		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_JOINSYNACKRX);
 	} else if (mopt->saw_mpc) {
 		struct sock *meta_sk = sk;

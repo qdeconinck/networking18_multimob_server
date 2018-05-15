@@ -976,16 +976,49 @@ struct sock *tcp_v6_hnd_req(struct sock *sk, struct sk_buff *skb)
 	const struct tcphdr *th = tcp_hdr(skb);
 	struct request_sock *req;
 	struct sock *nsk;
+	struct tcp_options_received tmp_opt;
+	struct mptcp_options_received mopt;
 
 	/* Find possible connection requests. */
 	req = inet6_csk_search_req(sk, th->source,
 				   &ipv6_hdr(skb)->saddr,
 				   &ipv6_hdr(skb)->daddr, tcp_v6_iif(skb));
 	if (req) {
-		nsk = tcp_check_req(sk, skb, req, false);
+		nsk = tcp_check_req(sk, skb, req, false, false);
 		if (!nsk)
 			reqsk_put(req);
 		return nsk;
+	}
+	if (is_meta_sk(sk)) {
+		tmp_opt.saw_tstamp = 0;
+		mptcp_init_mp_opt(&mopt);
+
+		if (th->doff > (sizeof(struct tcphdr)>>2)) {
+			tcp_parse_options(skb, &tmp_opt, &mopt, 0, NULL);
+
+			if (mopt.is_fast_join & MPTCPHDR_FAST_JOIN_IN ||
+			    mopt.is_fast_join & MPTCPHDR_FAST_JOIN_OUT) {
+				/* Since returning a child sk implies that the
+				 * connection is in established mode, create a
+				 * req and directly find it. The server can
+				 * then send data to the client without waiting
+				 * for an ACK from the client.
+				 * The semantic of TCP should be safe like this!
+				 */
+				mptcp_v6_join_request(sk, skb);
+				req = inet6_csk_search_req(sk, th->source,
+							   &ipv6_hdr(skb)->saddr,
+							   &ipv6_hdr(skb)->daddr,
+							   tcp_v6_iif(skb));
+				if (req) {
+					nsk = tcp_check_req(sk, skb, req, false, true);
+					if (!nsk)
+						reqsk_put(req);
+					return nsk;
+				}
+
+			}
+		}
 	}
 	nsk = __inet6_lookup_established(sock_net(sk), &tcp_hashinfo,
 					 &ipv6_hdr(skb)->saddr, th->source,

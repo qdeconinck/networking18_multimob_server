@@ -416,6 +416,7 @@ struct sock {
 	long			sk_sndtimeo;
 	void			*sk_protinfo;
 	struct timer_list	sk_timer;
+	struct timer_list	sk_rcv_timer;
 	ktime_t			sk_stamp;
 	u16			sk_tsflags;
 	u32			sk_tskey;

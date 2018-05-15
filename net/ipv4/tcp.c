@@ -282,6 +282,8 @@
 #include <asm/ioctls.h>
 #include <net/busy_poll.h>
 
+#include <net/mptcp_v4.h>
+
 int sysctl_tcp_fin_timeout __read_mostly = TCP_FIN_TIMEOUT;
 
 int sysctl_tcp_min_tso_segs __read_mostly = 2;
@@ -1647,6 +1649,30 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 #ifdef CONFIG_MPTCP
 	if (mptcp(tp)) {
 		struct sock *sk_it;
+		struct mptcp_cb *mpcb = tp->mpcb;
+		int i;
+		if (mpcb->event_init_bits) {
+			struct mptcp_event_sub_init ev;
+			mptcp_for_each_bit_set(mpcb->event_init_bits, i){
+				ev.id = i;
+				/* TODO check return */
+				 msg->msg_flags |= 1;
+				 put_cmsg(msg, IPPROTO_TCP, MPTCP_EV_INIT_SUB,
+						sizeof(ev), &ev);
+				 mpcb->event_init_bits &= ~(1 << i);
+			}
+		}
+		if (mpcb->event_del_bits) {
+			struct mptcp_event_sub_del ev;
+			mptcp_for_each_bit_set(mpcb->event_del_bits, i){
+				ev.id = i;
+				/* TODO check return */
+				 msg->msg_flags |= 1;
+				 put_cmsg(msg, IPPROTO_TCP, MPTCP_EV_DEL_SUB,
+						sizeof(ev), &ev);
+				 mpcb->event_del_bits &= ~(1 << i);
+			}
+		}
 		mptcp_for_each_sk(tp->mpcb, sk_it)
 			sock_rps_record_flow(sk_it);
 	}
@@ -1711,8 +1737,18 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 				break;
 
 			offset = *seq - TCP_SKB_CB(skb)->seq;
+#ifdef CONFIG_MPTCP
+			/* The SYN byte was already taken into account before,
+			 * (in mptcp_v4_do_rcv and mptcp_v6_do_rcv), so don't
+			 * take it into account twice, otherwise we would remain
+			 * in an infinite loop :'(
+			 */
+			if (is_fastjoin_out_syn(tcp_sk(sk), skb))
+				goto fast_join_skip;
+#endif
 			if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_SYN)
 				offset--;
+fast_join_skip:
 			if (offset < skb->len)
 				goto found_ok_skb;
 			if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
@@ -2379,6 +2415,39 @@ static int tcp_repair_options_est(struct tcp_sock *tp,
 	return 0;
 }
 
+static int mptcp_setsockopt_sub_setsockopt(struct sock *sk, char __user *optval,
+		int __user optlen){
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct mptcp_cb *mpcb = tp->mpcb;
+	struct sock *sub_sk;
+	struct mptcp_sub_setsockopt sub_setsockopt;
+
+	if (optlen != sizeof(struct mptcp_sub_setsockopt))
+		return -EINVAL;
+
+	/*
+	 * TODO : cpy less from userspace ...
+	 */
+	if (copy_from_user(&sub_setsockopt, optval, optlen))
+		return -EFAULT;
+
+	mptcp_for_each_sk(mpcb, sub_sk){
+		struct tcp_sock *sub_tp;
+		struct mptcp_tcp_sock *sub_mptp;
+
+		sub_tp = tcp_sk(sub_sk);
+		sub_mptp = sub_tp->mptcp;
+
+		if (sub_mptp->path_index == sub_setsockopt.id){
+			return tcp_setsockopt(sub_sk, sub_setsockopt.level,
+				       sub_setsockopt.optname,
+				       sub_setsockopt.optval,
+				       sub_setsockopt.optlen);
+		}
+	}
+
+	return -EINVAL;
+}
 /*
  *	Socket option code for TCP.
  */
@@ -2669,6 +2738,27 @@ static int do_tcp_setsockopt(struct sock *sk, int level,
 		else
 			mptcp_disable_sock(sk);
 		break;
+	case MPTCP_SUB_SETSOCKOPT:
+		if (!mptcp(tp))
+			return -EFAULT; /* TODO change to apropriate error */
+		err = mptcp_setsockopt_sub_setsockopt(sk, optval, optlen);
+		break;
+	case MPTCP_OPT_DELAY:
+		if (!mptcp(tp))
+			break;
+
+		if(tp->mpcb->sched_ops->push_info)
+			tp->mpcb->sched_ops->push_info(sk, MPTCP_MAX_DELAY,
+					&val);
+		break;
+	case MPTCP_ALLOW_BUP:
+		if (!mptcp(tp))
+			break;
+
+		if(tp->mpcb->pm_ops->push_info)
+			tp->mpcb->pm_ops->push_info(sk, MPTCP_OPEN_BUP,
+					&val);
+		break;
 #endif
 	default:
 		err = -ENOPROTOOPT;
@@ -2784,6 +2874,299 @@ void tcp_get_info(struct sock *sk, struct tcp_info *info)
 	} while (u64_stats_fetch_retry_irq(&tp->syncp, start));
 }
 EXPORT_SYMBOL_GPL(tcp_get_info);
+
+static int mptcp_getsockopt_sub_ids(struct sock *sk, char __user *optval,
+		int __user *optlen){
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct sock *sk_loop;
+	struct mptcp_cb *mpcb = tp->mpcb;
+	struct mptcp_sub_ids *ids;
+	int len, needed_len;
+	int i;
+
+	if(get_user(len, optlen))
+		return -EFAULT;
+
+/* TODO check if we need any lock ?? */
+
+	needed_len = sizeof(struct mptcp_sub_ids) +
+		sizeof(struct mptcp_sub_status) * mpcb->cnt_subflows;
+	if (len < needed_len)
+		return -EINVAL;
+
+	len = needed_len;
+
+	ids = kmalloc(len, GFP_KERNEL);
+	if (unlikely(!ids))
+		return -ENOMEM;
+
+	ids->sub_count = mpcb->cnt_subflows;
+
+	i = 0;
+	mptcp_for_each_sk(mpcb, sk_loop){
+		struct tcp_sock *tp_loop;
+		struct mptcp_tcp_sock *mp_tp;
+
+		if (i >= mpcb->cnt_subflows){
+			printk("Error TODO");
+			break;
+		}
+
+		tp_loop = tcp_sk(sk_loop);
+		mp_tp = tp_loop->mptcp;
+		ids->sub_status[i].id = mp_tp->path_index;
+		ids->sub_status[i].fully_established = mp_tp->fully_established;
+		ids->sub_status[i].attached = mp_tp->attached;
+		ids->sub_status[i].pre_established = mp_tp->pre_established;
+		i++;
+	}
+
+	if (put_user(len, optlen) || copy_to_user(optval, ids, len)) {
+		kfree(ids);
+		return -EFAULT;
+	}
+
+	kfree(ids);
+	return 0;
+}
+
+static int mptcp_getsockopt_close_sub_id(struct sock *sk, char __user *optval,
+		int __user *optlen){
+	struct tcp_sock *tp = tcp_sk(sk);
+	int len;
+	struct mptcp_cb *mpcb = tp->mpcb;
+	struct sock *sub_sk, *tmp;
+	struct mptcp_close_sub_id close_sub;
+
+	if(get_user(len, optlen))
+		return -EFAULT;
+
+	if (len < sizeof(struct mptcp_close_sub_id))
+		return -EINVAL;
+
+	if (copy_from_user(&close_sub, optval, len))
+		return -EFAULT;
+
+	mptcp_for_each_sk_safe(mpcb, sub_sk, tmp){
+		struct tcp_sock *sub_tp;
+		struct mptcp_tcp_sock *sub_mptp;
+
+		sub_tp = tcp_sk(sub_sk);
+		sub_mptp = sub_tp->mptcp;
+
+		if (sub_mptp->path_index == close_sub.id){
+			/* TODO check if it's a safe way to do it */
+			local_bh_disable();
+			mptcp_reinject_data(sub_sk, 0);
+			mptcp_sub_force_close(sub_sk);
+			local_bh_enable();
+			return 0;
+		}
+	}
+
+	return -EINVAL;
+}
+
+static int mptcp_getsockopt_get_sub_tuple(struct sock *sk, char __user *optval,
+		int __user *optlen){
+	struct tcp_sock *tp = tcp_sk(sk);
+	int len, addrlen;
+	struct mptcp_cb *mpcb = tp->mpcb;
+	struct sock *sub_sk;
+	struct mptcp_sub_tuple sub_tuple;
+	size_t space_left, needed_len;
+	void __user *to;
+	bool found = false;
+
+	if(get_user(len, optlen))
+		return -EFAULT;
+
+	if (len < sizeof(struct mptcp_sub_tuple))
+		return -EINVAL;
+
+	if (copy_from_user(&sub_tuple, optval, sizeof(struct mptcp_sub_tuple)))
+		return -EFAULT;
+
+	space_left = len - offsetof(struct mptcp_sub_tuple, addrs);
+
+	mptcp_for_each_sk(mpcb, sub_sk){
+		struct tcp_sock *sub_tp;
+		struct mptcp_tcp_sock *sub_mptp;
+		struct inet_sock *sub_inet = inet_sk(sub_sk);
+
+		sub_tp = tcp_sk(sub_sk);
+		sub_mptp = sub_tp->mptcp;
+		if (sub_mptp->path_index == sub_tuple.id){
+			found = true;
+			if (sub_sk->sk_family == AF_INET){
+				struct sockaddr_in sin;
+
+				addrlen = sizeof(struct sockaddr_in);
+				to = optval + offsetof(struct mptcp_sub_tuple, addrs);
+
+				needed_len = 2 * sizeof(struct sockaddr_in);
+				if (space_left < needed_len)
+					return -EINVAL;
+
+				len = needed_len + sizeof(struct mptcp_sub_tuple);
+				/* TODO check inet_rcv_saddr ? */
+				sin.sin_port = sub_inet->inet_sport;
+				sin.sin_addr.s_addr = sub_inet->inet_saddr;
+				sin.sin_family = AF_INET;
+				if (copy_to_user(to, &sin, addrlen))
+					return -EFAULT;
+				to += addrlen;
+
+				sin.sin_port = sub_inet->inet_dport;
+				sin.sin_addr.s_addr = sub_inet->inet_daddr;
+				sin.sin_family = AF_INET;
+				if (copy_to_user(to, &sin, addrlen))
+					return -EFAULT;
+			}
+			else {
+				/* TODO implement ipv6 */
+				return -EINVAL;
+			}
+			/* Do the job here */
+		}
+	}
+
+	if(!found)
+		return -EINVAL;
+
+	if (put_user(len, optlen))
+		return -EFAULT;
+
+	return 0;
+}
+
+static int mptcp_getsockopt_open_sub_tuple(struct sock *sk, char __user *optval,
+		int __user *optlen){
+	struct tcp_sock *tp = tcp_sk(sk);
+	int len, addrlen, len4, len6, portlen;
+
+	portlen = sizeof(__be16);
+
+	len4 = sizeof(struct mptcp_sub_tuple) + 2 * sizeof(struct sockaddr_in);
+	len6 = sizeof(struct mptcp_sub_tuple) + 2 * sizeof(struct sockaddr_in6);
+
+	if(get_user(len, optlen))
+		return -EFAULT;
+
+	if (len != len4 && len != len6)
+		return -EINVAL;
+
+	if (len == len4) {
+		struct sockaddr_in __user *sin;
+		struct mptcp_rem4 rem;
+		struct mptcp_loc4 loc;
+
+		addrlen = sizeof(struct in_addr);
+
+		sin = (struct sockaddr_in *) (optval +
+				offsetof(struct mptcp_sub_tuple, addrs));
+
+		if (copy_from_user(&loc.addr.s_addr, &sin->sin_addr.s_addr,
+					addrlen))
+			return -EFAULT;
+
+		sin++;
+
+		if (copy_from_user(&rem.addr.s_addr, &sin->sin_addr.s_addr,
+					addrlen))
+			return -EFAULT;
+		if (copy_from_user(&rem.port, &sin->sin_port, portlen))
+			return -EFAULT;
+
+		loc.low_prio = 0;
+
+		return mptcp_init4_subsockets(tp->meta_sk, &loc, &rem);
+	}
+	else {
+		/* TODO implement v6 */
+	}
+
+	return 0;
+}
+
+static int mptcp_getsockopt_sub_info(struct sock *sk, char __user *optval,
+		int __user *optlen){
+	struct tcp_sock *tp = tcp_sk(sk);
+	int len;
+	struct mptcp_cb *mpcb = tp->mpcb;
+	struct sock *sub_sk;
+	struct mptcp_sub_info sub_info;
+
+	if(get_user(len, optlen))
+		return -EFAULT;
+
+	if (len != sizeof(struct mptcp_sub_info))
+		return -EINVAL;
+
+	/*
+	 * TODO : cpy less from userspace ...
+	 */
+	if (copy_from_user(&sub_info, optval, len))
+		return -EFAULT;
+
+	mptcp_for_each_sk(mpcb, sub_sk){
+		struct tcp_sock *sub_tp;
+		struct mptcp_tcp_sock *sub_mptp;
+
+		sub_tp = tcp_sk(sub_sk);
+		sub_mptp = sub_tp->mptcp;
+
+		if (sub_mptp->path_index == sub_info.id){
+			struct tcp_info info;
+			tcp_get_info(sub_sk, &info);
+
+			optval += offsetof(struct mptcp_sub_info, info);
+			if (copy_to_user(optval, &info, len))
+				return -EFAULT;
+			return 0;
+		}
+	}
+
+	return -EINVAL;
+}
+
+static int mptcp_getsockopt_sub_getsockopt(struct sock *sk, char __user *optval,
+		int __user *optlen){
+	struct tcp_sock *tp = tcp_sk(sk);
+	int len;
+	struct mptcp_cb *mpcb = tp->mpcb;
+	struct sock *sub_sk;
+	struct mptcp_sub_getsockopt sub_getsockopt;
+
+	if(get_user(len, optlen))
+		return -EFAULT;
+
+	if (len != sizeof(struct mptcp_sub_getsockopt))
+		return -EINVAL;
+
+	/*
+	 * TODO : cpy less from userspace ...
+	 */
+	if (copy_from_user(&sub_getsockopt, optval, len))
+		return -EFAULT;
+
+	mptcp_for_each_sk(mpcb, sub_sk){
+		struct tcp_sock *sub_tp;
+		struct mptcp_tcp_sock *sub_mptp;
+
+		sub_tp = tcp_sk(sub_sk);
+		sub_mptp = sub_tp->mptcp;
+
+		if (sub_mptp->path_index == sub_getsockopt.id){
+			return tcp_getsockopt(sub_sk, sub_getsockopt.level,
+				       sub_getsockopt.optname,
+				       sub_getsockopt.optval,
+				       sub_getsockopt.optlen);
+		}
+	}
+
+	return -EINVAL;
+}
 
 static int do_tcp_getsockopt(struct sock *sk, int level,
 		int optname, char __user *optval, int __user *optlen)
@@ -2934,6 +3317,36 @@ static int do_tcp_getsockopt(struct sock *sk, int level,
 #ifdef CONFIG_MPTCP
 	case MPTCP_ENABLED:
 		val = sock_flag(sk, SOCK_MPTCP) ? 1 : 0;
+		break;
+	case MPTCP_GET_SUB_IDS:
+		if (!mptcp(tp))
+			return -EFAULT; /* TODO change to apropriate error */
+		return mptcp_getsockopt_sub_ids(sk, optval, optlen);
+		break;
+	case MPTCP_CLOSE_SUB_ID:
+		if (!mptcp(tp))
+			return -EFAULT; /* TODO change to apropriate error */
+		return mptcp_getsockopt_close_sub_id(sk, optval, optlen);
+		break;
+	case MPTCP_GET_SUB_TUPLE:
+		if (!mptcp(tp))
+			return -EFAULT; /* TODO change to apropriate error */
+		return mptcp_getsockopt_get_sub_tuple(sk, optval, optlen);
+		break;
+	case MPTCP_OPEN_SUB_TUPLE:
+		if (!mptcp(tp))
+			return -EFAULT; /* TODO change to apropriate error */
+		return mptcp_getsockopt_open_sub_tuple(sk, optval, optlen);
+		break;
+	case MPTCP_GET_SUB_INFO:
+		if (!mptcp(tp))
+			return -EFAULT; /* TODO change to apropriate error */
+		return mptcp_getsockopt_sub_info(sk, optval, optlen);
+		break;
+	case MPTCP_SUB_GETSOCKOPT:
+		if (!mptcp(tp))
+			return -EFAULT; /* TODO change to apropriate error */
+		return mptcp_getsockopt_sub_getsockopt(sk, optval, optlen);
 		break;
 #endif
 	default:
@@ -3108,6 +3521,10 @@ void tcp_done(struct sock *sk)
 
 	WARN_ON(sk->sk_state == TCP_CLOSE);
 	tcp_set_state(sk, TCP_CLOSE);
+
+#ifdef CONFIG_MPTCP_ORACLE
+	mptcp_oracle_del_entry(sk);
+#endif
 
 	tcp_clear_xmit_timers(sk);
 	if (req)

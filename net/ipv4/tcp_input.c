@@ -3287,6 +3287,14 @@ bool tcp_may_update_window(const struct tcp_sock *tp, const u32 ack,
 		(ack_seq == tp->snd_wl1 && nwin > tp->snd_wnd);
 }
 
+static inline void tcp_request_rtt(struct tcp_sock *tp, u32 delta) {
+	tp->cnt_bytes_rtt_req += delta;
+	if (tp->cnt_bytes_rtt_req >= sysctl_mptcp_request_rtt) {
+		tp->mptcp->request_rtt = 1;
+		tp->cnt_bytes_rtt_req = tp->cnt_bytes_rtt_req % sysctl_mptcp_request_rtt;
+	}
+}
+
 /* If we update tp->snd_una, also update tp->bytes_acked */
 static void tcp_snd_una_update(struct tcp_sock *tp, u32 ack)
 {
@@ -3299,7 +3307,7 @@ static void tcp_snd_una_update(struct tcp_sock *tp, u32 ack)
 }
 
 /* If we update tp->rcv_nxt, also update tp->bytes_received */
-static void tcp_rcv_nxt_update(struct tcp_sock *tp, u32 seq)
+void tcp_rcv_nxt_update(struct tcp_sock *tp, u32 seq)
 {
 	u32 delta = seq - tp->rcv_nxt;
 
@@ -3307,6 +3315,9 @@ static void tcp_rcv_nxt_update(struct tcp_sock *tp, u32 seq)
 	tp->bytes_received += delta;
 	u64_stats_update_end(&tp->syncp);
 	tp->rcv_nxt = seq;
+	if (mptcp(tp) && tp->mptcp && sysctl_mptcp_request_rtt)
+		tcp_request_rtt(tp, delta);
+
 }
 
 /* Update our send window.
@@ -3485,6 +3496,10 @@ static int tcp_ack(struct sock *sk, struct sk_buff *skb, int flag)
 	/* We very likely will need to access write queue head. */
 	prefetchw(sk->sk_write_queue.next);
 
+	/* XXX Maybe it will work? */
+	if (mptcp(tp) && tp->mptcp && tp->mpcb && tp->mpcb->rcv_timer_running)
+		mptcp_reset_rcv_timer(mptcp_meta_sk(sk));
+
 	/* If the ack is older than previous acks
 	 * then we can probably ignore it.
 	 */
@@ -3560,6 +3575,16 @@ static int tcp_ack(struct sock *sk, struct sk_buff *skb, int flag)
 	/* We passed data and got it acked, remove any soft error
 	 * log. Something worked...
 	 */
+
+	/* If using fast join, RTT for server should be computed correctly
+	 * /!\ Do not cope with losses
+	 */
+	if (tp->wait_first_ack) {
+		long rtt_us = jiffies_to_usecs(tcp_time_stamp - tp->synack_stamp);
+		tp->wait_first_ack = 0;
+		tcp_ack_update_rtt(sk, FLAG_SYN_ACKED, rtt_us, -1L);
+	}
+
 	sk->sk_err_soft = 0;
 	icsk->icsk_probes_out = 0;
 	tp->rcv_tstamp = tcp_time_stamp;
@@ -3933,6 +3958,7 @@ static inline bool tcp_sequence(const struct tcp_sock *tp, u32 seq, u32 end_seq)
 /* When we get a reset we do this. */
 void tcp_reset(struct sock *sk)
 {
+	struct tcp_sock *tp = tcp_sk(sk);
 	/* We want the right error as BSD sees it (and indeed as we do). */
 	switch (sk->sk_state) {
 	case TCP_SYN_SENT:
@@ -3945,6 +3971,15 @@ void tcp_reset(struct sock *sk)
 		return;
 	default:
 		sk->sk_err = ECONNRESET;
+	}
+	/* If the MPTCP subflow was reset at TCP level and is the last one,
+	 * open backup subflows if any! */
+	if (mptcp(tp)) {
+		struct sock *meta_sk = mptcp_meta_sk(sk);
+		struct tcp_sock *meta_tp = tcp_sk(meta_sk);
+		struct mptcp_cb *mpcb = meta_tp->mpcb;
+		if (!mpcb->close_meta && mpcb->cnt_subflows <= 1 && mpcb->pm_ops->push_info)
+			mptcp_request_fast_join(meta_sk, tp->mpcb);
 	}
 	/* This barrier is coupled with smp_rmb() in tcp_poll() */
 	smp_wmb();
@@ -4299,6 +4334,9 @@ static void tcp_ofo_queue(struct sock *sk)
 		tail = skb_peek_tail(&sk->sk_receive_queue);
 		eaten = tail && tcp_try_coalesce(sk, tail, skb, &fragstolen);
 		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
+		if (mptcp(tp) && tp->mptcp && tp->rcv_nxt == tp->mptcp->idle_for_tcp_seq) {
+			mptcp_stop_rcv_timer(mptcp_meta_sk(sk));
+		}
 		if (!eaten)
 			__skb_queue_tail(&sk->sk_receive_queue, skb);
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
@@ -4534,6 +4572,11 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 
 	tp->rx_opt.dsack = 0;
 
+	if (mptcp(tp) && tp->mptcp && tp->mpcb && tp->mptcp->rx_opt.mp_idle) {
+		tp->mpcb->idle_for_seq = tp->mptcp->rx_opt.data_seq + tp->mptcp->rx_opt.data_len;
+		tp->mptcp->idle_for_tcp_seq = TCP_SKB_CB(skb)->end_seq;
+	}
+
 	/*  Queue data for delivery to the user.
 	 *  Packets in sequence go to the receive queue.
 	 *  Out of sequence packets to the out_of_order_queue.
@@ -4570,6 +4613,9 @@ queue_and_out:
 			eaten = tcp_queue_rcv(sk, skb, 0, &fragstolen);
 		}
 		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
+		if (mptcp(tp) && tp->mptcp && tp->rcv_nxt == tp->mptcp->idle_for_tcp_seq) {
+			mptcp_stop_rcv_timer(mptcp_meta_sk(sk));
+		}
 		if (skb->len || mptcp_is_data_fin(skb))
 			tcp_event_data_recv(sk, skb);
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
@@ -5419,12 +5465,17 @@ slow_path:
 	/*
 	 *	Standard slow path.
 	 */
-
-	if (!tcp_validate_incoming(sk, skb, th, 1))
+	/* The SYN containing the MP_FAST_JOIN_OUT is actually a quite special
+	 * packet; bypass validate incoming */
+	if (!is_fastjoin_out_syn(tcp_sk(sk), skb) &&
+	    !tcp_validate_incoming(sk, skb, th, 1))
 		return;
 
 step5:
-	if (tcp_ack(sk, skb, FLAG_SLOWPATH | FLAG_UPDATE_TS_RECENT) < 0)
+	/* The SYN containing the MP_FAST_JOIN_OUT have data, but no ACK number
+	 * was previously assigned... So bypass this function */
+	if (!is_fastjoin_out_syn(tcp_sk(sk), skb) &&
+	    (tcp_ack(sk, skb, FLAG_SLOWPATH | FLAG_UPDATE_TS_RECENT) < 0))
 		goto discard;
 
 	tcp_rcv_rtt_measure_ts(sk, skb);
@@ -5824,6 +5875,8 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 	int queued = 0;
 	bool acceptable;
 	u32 synack_stamp;
+	struct sock *tmp_sk;
+	struct tcp_sock *tmp_tp;
 
 	tp->rx_opt.saw_tstamp = 0;
 
@@ -5895,14 +5948,14 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 		WARN_ON_ONCE(sk->sk_state != TCP_SYN_RECV &&
 		    sk->sk_state != TCP_FIN_WAIT1);
 
-		if (!tcp_check_req(sk, skb, req, true))
+		if (!tcp_check_req(sk, skb, req, true, false))
 			goto discard;
 	}
 
 	if (!th->ack && !th->rst && !th->syn)
 		goto discard;
 
-	if (!tcp_validate_incoming(sk, skb, th, 0))
+	if (!is_fastjoin_syn(tp, skb) && !tcp_validate_incoming(sk, skb, th, 0))
 		return 0;
 
 	/* step 5: check the ACK field */
@@ -5911,7 +5964,7 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 
 	switch (sk->sk_state) {
 	case TCP_SYN_RECV:
-		if (!acceptable)
+		if (!is_fastjoin_syn(tp, skb) && !acceptable)
 			return 1;
 
 		/* Once we leave TCP_SYN_RECV, we no longer need req
@@ -5941,6 +5994,62 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 		 */
 		if (sk->sk_socket)
 			sk_wake_async(sk, SOCK_WAKE_IO, POLL_OUT);
+
+		if (mptcp(tp) &&
+		    (tp->mptcp->rx_opt.is_fast_join & MPTCPHDR_FAST_JOIN_IN ||
+		     tp->mptcp->rx_opt.is_fast_join & MPTCPHDR_FAST_JOIN_OUT)) {
+			tp->snd_una = tp->snd_nxt;
+			/* Because it will be a SYN, th->window contains the
+			 * right window */
+			tp->snd_wnd = ntohs(th->window);
+			tcp_init_wl(tp, TCP_SKB_CB(skb)->seq);
+			/* Masquerade synack_stamp, currently ugly */
+			synack_stamp = tcp_time_stamp - 1;
+			tcp_synack_rtt_meas(sk, synack_stamp);
+			tp->advmss -= MPTCP_SUB_LEN_DSM_ALIGN;
+			tcp_init_metrics(sk);
+			tcp_initialize_rcv_mss(sk);
+			/* Don't forget to indicate it can be used to send data
+			 */
+			tp->mptcp->fully_established = 1;
+			tcp_fast_path_on(tp);
+			tp->synack_stamp = synack_stamp;
+			tp->wait_first_ack = 1;
+			/* It's a fast join, so assmume it has the newest data
+			 */
+			tp->mptcp_new_last_tstamp = tcp_time_stamp;
+			/* Check if there is a high RTO subflow; if yes,
+			 * reinject its data */
+			mptcp_for_each_sk(tp->mpcb, tmp_sk) {
+				tmp_tp = tcp_sk(tmp_sk);
+				if (sk != tmp_sk && (tmp_tp->high_rto || tmp_tp->was_bad || tmp_tp->pf))
+					mptcp_reinject_data(tmp_sk, 1);
+			}
+			/* If the host received a MP_FAST_JOIN_IN, it indicates
+			 * that something went wrong with other "active"
+			 * subflows. Therefore, reinject their data, which cause
+			 * these to be potentially failed until receiving an ACK
+			 * from one of them. Like this, the default scheduler
+			 * can prioritize the backup subflow when needed.
+			 */
+			// XXX Remove this to make server scheduler useful
+			//mptcp_for_each_sk(tp->mpcb, tmp_sk) {
+			//	if (sk != tmp_sk)
+			//		mptcp_reinject_data(tmp_sk, 1);
+			//}
+			/* Well, this is a little tricky... It seems that
+			 * queuing directly the SYN as a data can cause big
+			 * troubles, which can probably be explained by the fact
+			 * that some validation checks and other  were bypassed.
+			 * But don't worry, you will come back in
+			 * tcp_rcv_state_process again with this packet later
+			 * because we came from tcp_v4_rcv which first check the
+			 * request and then process it again as it was a regular
+			 * data packet. Useful functions like tcp_prequeue can
+			 * then be called.
+			 */
+			return 0;
+		}
 
 		tp->snd_una = TCP_SKB_CB(skb)->ack_seq;
 		tp->snd_wnd = ntohs(th->window) << tp->rx_opt.snd_wscale;
@@ -6248,7 +6357,6 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
 	struct flowi fl;
 	struct tcp_fastopen_cookie foc = { .len = -1 };
 	int err;
-
 
 	/* TW buckets are converted to open requests without
 	 * limitations, they conserve resources and peer is

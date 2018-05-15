@@ -593,7 +593,8 @@ EXPORT_SYMBOL(tcp_create_openreq_child);
 
 struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 			   struct request_sock *req,
-			   bool fastopen)
+			   bool fastopen,
+			   bool fastjoin)
 {
 	struct tcp_options_received tmp_opt;
 	struct mptcp_options_received mopt;
@@ -622,10 +623,13 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 		}
 	}
 
-	/* Check for pure retransmitted SYN. */
+	/* Check for pure retransmitted SYN.
+	 * This check must be bypassed when considering fastjoin.
+	 */
 	if (TCP_SKB_CB(skb)->seq == tcp_rsk(req)->rcv_isn &&
 	    flg == TCP_FLAG_SYN &&
-	    !paws_reject) {
+	    !paws_reject &&
+	    !fastjoin) {
 		/*
 		 * RFC793 draws (Incorrectly! It was fixed in RFC1122)
 		 * this case on figure 6 and figure 8, but formal
@@ -742,8 +746,9 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 
 	/* RFC793: "first check sequence number". */
 
-	if (paws_reject || !tcp_in_window(TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq,
-					  tcp_rsk(req)->rcv_nxt, tcp_rsk(req)->rcv_nxt + req->rcv_wnd)) {
+	if (paws_reject || (fastjoin && TCP_SKB_CB(skb)->end_seq != tcp_rsk(req)->rcv_nxt)
+	    || (!fastjoin && !tcp_in_window(TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq,
+					  tcp_rsk(req)->rcv_nxt, tcp_rsk(req)->rcv_nxt + req->rcv_wnd))) {
 		/* Out of window: send ACK and drop. */
 		if (!(flg & TCP_FLAG_RST))
 			req->rsk_ops->send_ack(sk, skb, req);
@@ -776,8 +781,10 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 	 *
 	 * XXX (TFO) - if we ever allow "data after SYN", the
 	 * following check needs to be removed.
+	 *
+	 * XXX (Fast Join) - this check must be removed.
 	 */
-	if (!(flg & TCP_FLAG_ACK))
+	if (!fastjoin && !(flg & TCP_FLAG_ACK))
 		return NULL;
 
 	/* For Fast Open no more processing is needed (sk is the
@@ -800,6 +807,7 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 	 * ESTABLISHED STATE. If it will be dropped after
 	 * socket is created, wait for troubles.
 	 */
+	// TODO create the child socket for mptcp in join
 	child = inet_csk(sk)->icsk_af_ops->syn_recv_sock(sk, skb, req, NULL);
 	if (!child)
 		goto listen_overflow;
@@ -813,6 +821,7 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 		if (!ret)
 			return tcp_sk(child)->mpcb->master_sk;
 	} else {
+		// TODO seems here, it should be called for Fast Join
 		return mptcp_check_req_child(sk, child, req, &mopt);
 	}
 

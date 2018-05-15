@@ -1382,14 +1382,43 @@ struct sock *tcp_v4_hnd_req(struct sock *sk, struct sk_buff *skb)
 	const struct iphdr *iph = ip_hdr(skb);
 	struct request_sock *req;
 	struct sock *nsk;
+	struct tcp_options_received tmp_opt;
+	struct mptcp_options_received mopt;
 
 	req = inet_csk_search_req(sk, th->source, iph->saddr, iph->daddr);
 	if (req) {
-		nsk = tcp_check_req(sk, skb, req, false);
+		nsk = tcp_check_req(sk, skb, req, false, false);
 		if (!nsk)
 			reqsk_put(req);
 		return nsk;
 	}
+	if (is_meta_sk(sk)) {
+		tmp_opt.saw_tstamp = 0;
+		mptcp_init_mp_opt(&mopt);
+
+		if (th->doff > (sizeof(struct tcphdr)>>2)) {
+			tcp_parse_options(skb, &tmp_opt, &mopt, 0, NULL);
+
+			if (mopt.is_fast_join & MPTCPHDR_FAST_JOIN_IN ||
+				mopt.is_fast_join & MPTCPHDR_FAST_JOIN_OUT) {
+				/* Since returning a child sk implies that the
+				 * connection is in established mode, create a
+				 * req and directly find it. The server can
+				 * then send data to the client without waiting
+				 * for an ACK from the client.
+				 * The semantic of TCP should be safe like this!
+				 */
+				mptcp_v4_join_request(sk, skb);
+				req = inet_csk_search_req(sk, th->source, iph->saddr, iph->daddr);
+				if (req) {
+					nsk = tcp_check_req(sk, skb, req, false, true);
+					if (!nsk)
+						reqsk_put(req);
+					return nsk;
+				}
+			}
+		}
+        }
 
 	nsk = inet_lookup_established(sock_net(sk), &tcp_hashinfo, iph->saddr,
 			th->source, iph->daddr, th->dest, inet_iif(skb));
@@ -1662,9 +1691,14 @@ process:
 #ifdef CONFIG_MPTCP
 	/* Is there a pending request sock for this segment ? */
 	if (sk->sk_state == TCP_LISTEN && mptcp_check_req(skb, net)) {
-		if (sk)
-			sock_put(sk);
-		return 0;
+		/* If data in SYN, process then in tcp_rcv_state_process to
+		 * avoid issues regarding queuing skb
+		 */
+		if (!sk || !tcp_sk(sk)->mptcp || !tcp_sk(sk)->mptcp->rx_opt.is_fast_join) {
+			if (sk)
+				sock_put(sk);
+			return 0;
+		}
 	}
 #endif
 

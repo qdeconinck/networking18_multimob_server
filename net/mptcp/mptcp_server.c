@@ -1,18 +1,20 @@
 /* MPTCP Scheduler module selector. Highly inspired by tcp_cong.c */
 
+/*
+ * Should be based on tcp_sock->rcv_tstamp
+ */
+
 #include <linux/module.h>
 #include <net/mptcp.h>
 
-static DEFINE_SPINLOCK(mptcp_sched_list_lock);
-static LIST_HEAD(mptcp_sched_list);
 
-struct defsched_priv {
+struct serversched_priv {
 	u32	last_rbuf_opti;
 };
 
-static struct defsched_priv *defsched_get_priv(const struct tcp_sock *tp)
+static struct serversched_priv *serversched_get_priv(const struct tcp_sock *tp)
 {
-	return (struct defsched_priv *)&tp->mptcp->mptcp_sched[0];
+	return (struct serversched_priv *)&tp->mptcp->mptcp_sched[0];
 }
 
 static bool mptcp_is_def_unavailable(struct sock *sk)
@@ -119,20 +121,28 @@ static int mptcp_dont_reinject_skb(const struct tcp_sock *tp, const struct sk_bu
 		mptcp_pi_to_flag(tp->mptcp->path_index) & TCP_SKB_CB(skb)->path_mask;
 }
 
+static bool subflow_is_backup(const struct tcp_sock *tp)
+{
+	return tp->mptcp->rcv_low_prio || tp->mptcp->low_prio;
+}
+
+static bool subflow_is_active(const struct tcp_sock *tp)
+{
+	return !tp->mptcp->rcv_low_prio && !tp->mptcp->low_prio;
+}
+
 /* Generic function to iterate over used and unused subflows and to select the
  * best one
  */
 static struct sock
 *get_subflow_from_selectors(struct mptcp_cb *mpcb, struct sk_buff *skb,
 			    bool (*selector)(const struct tcp_sock *),
-			    bool zero_wnd_test, bool *force, int *was_bad)
+			    bool zero_wnd_test, bool *force)
 {
 	struct sock *bestsk = NULL;
 	u32 min_srtt = 0xffffffff;
 	bool found_unused = false;
 	bool found_unused_una = false;
-	int best_high_rto = 0;
-	int best_was_bad = 0;
 	struct sock *sk;
 
 	mptcp_for_each_sk(mpcb, sk) {
@@ -172,21 +182,9 @@ static struct sock
 			found_unused = true;
 		}
 
-		/* If the bestsk does not have high rto, but this one yes, don't consider it anymore */
-		if (bestsk && !best_high_rto && tp->high_rto)
-			continue;
-
-		/* If the bestsk was not declared bad before, but this one yes, don't consider it anymore */
-		if (bestsk && !best_was_bad && tp->was_bad)
-			continue;
-
-		/* Also accept subflow that has no high rto, even if not the lowest rtt one */
-		if (tp->srtt_us < min_srtt || (!tp->high_rto && best_high_rto) || (!tp->was_bad && best_was_bad)) {
+		if (tp->srtt_us < min_srtt) {
 			min_srtt = tp->srtt_us;
 			bestsk = sk;
-			best_high_rto = tp->high_rto;
-			best_was_bad = tp->was_bad;
-			*was_bad = tp->was_bad | tp->high_rto;
 		}
 	}
 
@@ -211,6 +209,87 @@ static struct sock
 	return bestsk;
 }
 
+static struct sock *get_server_available_subflow(struct mptcp_cb *mpcb,
+				struct sk_buff *skb, bool zero_wnd_test, bool *found)
+{
+	struct sock *sk, *lastsk = NULL;
+	struct tcp_sock *tp;
+	u32 last_new_rcv_tstamp = 0;
+	u32 last_new_rcv_regular_tstamp = 0;
+	int best_high_rto = 0;
+	int best_was_bad = 0;
+
+	*found = false;
+	/* First explore regular paths */
+	mptcp_for_each_sk(mpcb, sk) {
+		tp = tcp_sk(sk);
+		if (!subflow_is_active(tp))
+			continue;
+		if (time_after((unsigned long)tp->mptcp_new_last_tstamp, (unsigned long)last_new_rcv_tstamp))
+		{
+			//printk(KERN_ALERT "Path index %d has the last timestamp: %d\n", tcp_sk(sk)->mptcp->path_index, tcp_sk(sk)->mptcp_new_last_tstamp);
+			if (mptcp_is_def_unavailable(sk))
+				continue;
+			if (mptcp_dont_reinject_skb(tp, skb))
+				continue;
+
+			/* If the bestsk does not have high rto, but this one yes, don't consider it anymore */
+			if (lastsk && !best_high_rto && tp->high_rto)
+				continue;
+
+			/* If the bestsk was not declared bad before, but this one yes, don't consider it anymore */
+			if (lastsk && !best_was_bad && tp->was_bad)
+				continue;
+
+			last_new_rcv_regular_tstamp = tp->mptcp_new_last_tstamp;
+			best_high_rto = tp->high_rto;
+			best_was_bad = tp->was_bad;
+			if (mptcp_is_temp_unavailable(sk, skb, zero_wnd_test))
+				continue;
+			*found = true;
+			lastsk = sk;
+			last_new_rcv_tstamp = tp->mptcp_new_last_tstamp;
+		}
+	}
+
+	/* If there is a regular path that should be selected but its cwnd if full,
+	 * avoid considering backup subflows having time lower than this one */
+	if (!best_high_rto && !best_was_bad && time_after((unsigned long)last_new_rcv_regular_tstamp, (unsigned long)last_new_rcv_tstamp))
+		last_new_rcv_tstamp = last_new_rcv_regular_tstamp;
+
+	/* Then explore all paths */
+	mptcp_for_each_sk(mpcb, sk) {
+		tp = tcp_sk(sk);
+		if (time_after((unsigned long)tp->mptcp_new_last_tstamp, (unsigned long)last_new_rcv_tstamp))
+		{
+			//printk(KERN_ALERT "Path index %d has the last timestamp: %d\n", tcp_sk(sk)->mptcp->path_index, tcp_sk(sk)->mptcp_new_last_tstamp);
+			if (mptcp_is_def_unavailable(sk))
+				continue;
+			if (mptcp_dont_reinject_skb(tp, skb))
+				continue;
+			/* If the bestsk does not have high rto, but this one yes, don't consider it anymore */
+			if (lastsk && !best_high_rto && tp->high_rto)
+				continue;
+
+			/* If the bestsk was not declared bad before, but this one yes, don't consider it anymore */
+			if (lastsk && !best_was_bad && tp->was_bad)
+				continue;
+
+			best_high_rto = tp->high_rto;
+			best_was_bad = tp->was_bad;
+
+			*found = true;
+			if (mptcp_is_temp_unavailable(sk, skb, zero_wnd_test))
+				continue;
+
+			lastsk = sk;
+			last_new_rcv_tstamp = tcp_sk(sk)->mptcp_new_last_tstamp;
+		}
+	}
+
+	return lastsk;
+}
+
 /* This is the scheduler. This function decides on which flow to send
  * a given MSS. If all subflows are found to be busy, NULL is returned
  * The flow is selected based on the shortest RTT.
@@ -218,14 +297,13 @@ static struct sock
  *
  * Additionally, this function is aware of the backup-subflows.
  */
-static struct sock *get_available_subflow(struct sock *meta_sk,
+static struct sock *server_get_available_subflow(struct sock *meta_sk,
 					  struct sk_buff *skb,
 					  bool zero_wnd_test)
 {
 	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
-	struct sock *rsk, *sk;
-	bool force;
-	int was_bad;
+	struct sock *sk;
+	bool found;
 
 	/* if there is only one subflow, bypass the scheduling function */
 	if (mpcb->cnt_subflows == 1) {
@@ -245,33 +323,33 @@ static struct sock *get_available_subflow(struct sock *meta_sk,
 		}
 	}
 
+	return get_server_available_subflow(mpcb, skb, zero_wnd_test, &found);
+
+	//if (found)
+	//{
+	//	return sk;
+	//}
+
 	/* Find the best subflow */
-	rsk = get_subflow_from_selectors(mpcb, skb, &mptcp_subflow_is_active,
-					zero_wnd_test, &force, &was_bad);
-	if (force && !was_bad)
+	//sk = get_subflow_from_selectors(mpcb, skb, &subflow_is_active,
+	//				zero_wnd_test, &force);
+	//if (force)
 		/* one unused active sk or one NULL sk when there is at least
 		 * one temporally unavailable unused active sk
 		 */
-		return rsk;
+	//	return sk;
 
-	sk = get_subflow_from_selectors(mpcb, skb, &mptcp_subflow_is_backup,
-					zero_wnd_test, &force, &was_bad);
-	if (!force) {
+	//sk = get_subflow_from_selectors(mpcb, skb, &subflow_is_backup,
+	//				zero_wnd_test, &force);
+	//if (!force)
 		/* one used backup sk or one NULL sk where there is no one
 		 * temporally unavailable unused backup sk
 		 *
 		 * the skb passed through all the available active and backups
 		 * sks, so clean the path mask
 		 */
-		/* XXX remove this, because TCP retransmit timers should do the trick */
-		// TCP_SKB_CB(skb)->path_mask = 0;
-		return NULL;
-    }
-	/* Backup was also bad */
-	if (was_bad)
-		return rsk;
-
-	return sk;
+	//	TCP_SKB_CB(skb)->path_mask = 0;
+	//return sk;
 }
 
 static struct sk_buff *mptcp_rcv_buf_optimization(struct sock *sk, int penal)
@@ -280,7 +358,7 @@ static struct sk_buff *mptcp_rcv_buf_optimization(struct sock *sk, int penal)
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_sock *tp_it;
 	struct sk_buff *skb_head;
-	struct defsched_priv *dsp = defsched_get_priv(tp);
+	struct serversched_priv *dsp = serversched_get_priv(tp);
 
 	if (tp->mpcb->cnt_subflows == 1)
 		return NULL;
@@ -379,7 +457,7 @@ static struct sk_buff *__mptcp_next_segment(struct sock *meta_sk, int *reinject)
 		if (!skb && meta_sk->sk_socket &&
 		    test_bit(SOCK_NOSPACE, &meta_sk->sk_socket->flags) &&
 		    sk_stream_wspace(meta_sk) < sk_stream_min_wspace(meta_sk)) {
-			struct sock *subsk = get_available_subflow(meta_sk, NULL,
+			struct sock *subsk = server_get_available_subflow(meta_sk, NULL,
 								   false);
 			if (!subsk)
 				return NULL;
@@ -392,7 +470,7 @@ static struct sk_buff *__mptcp_next_segment(struct sock *meta_sk, int *reinject)
 	return skb;
 }
 
-static struct sk_buff *mptcp_next_segment(struct sock *meta_sk,
+static struct sk_buff *mptcp_server_next_segment(struct sock *meta_sk,
 					  int *reinject,
 					  struct sock **subsk,
 					  unsigned int *limit)
@@ -409,7 +487,7 @@ static struct sk_buff *mptcp_next_segment(struct sock *meta_sk,
 	if (!skb)
 		return NULL;
 
-	*subsk = get_available_subflow(meta_sk, skb, false);
+	*subsk = server_get_available_subflow(meta_sk, skb, false);
 	if (!*subsk)
 		return NULL;
 
@@ -457,127 +535,40 @@ static struct sk_buff *mptcp_next_segment(struct sock *meta_sk,
 	return skb;
 }
 
-static void defsched_init(struct sock *sk)
+static void serversched_init(struct sock *sk)
 {
-	struct defsched_priv *dsp = defsched_get_priv(tcp_sk(sk));
+	struct serversched_priv *dsp = serversched_get_priv(tcp_sk(sk));
 
 	dsp->last_rbuf_opti = tcp_time_stamp;
 }
 
-struct mptcp_sched_ops mptcp_sched_default = {
-	.get_subflow = get_available_subflow,
-	.next_segment = mptcp_next_segment,
-	.init = defsched_init,
-	.name = "default",
+static struct mptcp_sched_ops mptcp_sched_server = {
+	.get_subflow = server_get_available_subflow,
+	.next_segment = mptcp_server_next_segment,
+	.init = serversched_init,
+	.name = "server",
 	.owner = THIS_MODULE,
 };
 
-static struct mptcp_sched_ops *mptcp_sched_find(const char *name)
+static int __init server_register(void)
 {
-	struct mptcp_sched_ops *e;
+	BUILD_BUG_ON(sizeof(struct serversched_priv) > MPTCP_SCHED_SIZE);
 
-	list_for_each_entry_rcu(e, &mptcp_sched_list, list) {
-		if (strcmp(e->name, name) == 0)
-			return e;
-	}
+	if (mptcp_register_scheduler(&mptcp_sched_server))
+		return -1;
 
-	return NULL;
+	return 0;
 }
 
-int mptcp_register_scheduler(struct mptcp_sched_ops *sched)
+static void server_unregister(void)
 {
-	int ret = 0;
-
-	if (!sched->get_subflow || !sched->next_segment)
-		return -EINVAL;
-
-	spin_lock(&mptcp_sched_list_lock);
-	if (mptcp_sched_find(sched->name)) {
-		pr_notice("%s already registered\n", sched->name);
-		ret = -EEXIST;
-	} else {
-		list_add_tail_rcu(&sched->list, &mptcp_sched_list);
-		pr_info("%s registered\n", sched->name);
-	}
-	spin_unlock(&mptcp_sched_list_lock);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(mptcp_register_scheduler);
-
-void mptcp_unregister_scheduler(struct mptcp_sched_ops *sched)
-{
-	spin_lock(&mptcp_sched_list_lock);
-	list_del_rcu(&sched->list);
-	spin_unlock(&mptcp_sched_list_lock);
-}
-EXPORT_SYMBOL_GPL(mptcp_unregister_scheduler);
-
-void mptcp_get_default_scheduler(char *name)
-{
-	struct mptcp_sched_ops *sched;
-
-	BUG_ON(list_empty(&mptcp_sched_list));
-
-	rcu_read_lock();
-	sched = list_entry(mptcp_sched_list.next, struct mptcp_sched_ops, list);
-	strncpy(name, sched->name, MPTCP_SCHED_NAME_MAX);
-	rcu_read_unlock();
+	mptcp_unregister_scheduler(&mptcp_sched_server);
 }
 
-int mptcp_set_default_scheduler(const char *name)
-{
-	struct mptcp_sched_ops *sched;
-	int ret = -ENOENT;
+module_init(server_register);
+module_exit(server_unregister);
 
-	spin_lock(&mptcp_sched_list_lock);
-	sched = mptcp_sched_find(name);
-#ifdef CONFIG_MODULES
-	if (!sched && capable(CAP_NET_ADMIN)) {
-		spin_unlock(&mptcp_sched_list_lock);
-
-		request_module("mptcp_%s", name);
-		spin_lock(&mptcp_sched_list_lock);
-		sched = mptcp_sched_find(name);
-	}
-#endif
-
-	if (sched) {
-		list_move(&sched->list, &mptcp_sched_list);
-		ret = 0;
-	} else {
-		pr_info("%s is not available\n", name);
-	}
-	spin_unlock(&mptcp_sched_list_lock);
-
-	return ret;
-}
-
-void mptcp_init_scheduler(struct mptcp_cb *mpcb)
-{
-	struct mptcp_sched_ops *sched;
-
-	rcu_read_lock();
-	list_for_each_entry_rcu(sched, &mptcp_sched_list, list) {
-		if (try_module_get(sched->owner)) {
-			mpcb->sched_ops = sched;
-			break;
-		}
-	}
-	rcu_read_unlock();
-}
-
-/* Manage refcounts on socket close. */
-void mptcp_cleanup_scheduler(struct mptcp_cb *mpcb)
-{
-	module_put(mpcb->sched_ops->owner);
-}
-
-/* Set default value from kernel configuration at bootup */
-static int __init mptcp_scheduler_default(void)
-{
-	BUILD_BUG_ON(sizeof(struct defsched_priv) > MPTCP_SCHED_SIZE);
-
-	return mptcp_set_default_scheduler(CONFIG_DEFAULT_MPTCP_SCHED);
-}
-late_initcall(mptcp_scheduler_default);
+MODULE_AUTHOR("Quentin De Coninck");
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("SERVER SCHEDULER");
+MODULE_VERSION("0.90");

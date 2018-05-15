@@ -98,6 +98,12 @@ void tcp_time_wait(struct sock *sk, int state, int timeo);
 				 * 15 is ~13-30min depending on RTO.
 				 */
 
+#define TCP_RETR3	3	/*
+				 * This value is specific to Multipath TCP
+				 * subflows, 3 corresponds to ~3sec-8min
+				 * depending on RTO.
+				 */
+
 #define TCP_SYN_RETRIES	 6	/* This is how many retries are done
 				 * when active opening a connection.
 				 * RFC1122 says the minimum retry MUST
@@ -148,6 +154,7 @@ void tcp_time_wait(struct sock *sk, int state, int timeo);
 #define TCP_KEEPALIVE_TIME	(120*60*HZ)	/* two hours */
 #define TCP_KEEPALIVE_PROBES	9		/* Max of 9 keepalive probes	*/
 #define TCP_KEEPALIVE_INTVL	(75*HZ)
+#define TCP_KEEPALIVE_INTVL_MS	(500*HZ)	/* Because it is then divided by HZ */
 
 #define MAX_TCP_KEEPIDLE	32767
 #define MAX_TCP_KEEPINTVL	32767
@@ -265,10 +272,12 @@ extern int sysctl_tcp_fin_timeout;
 extern int sysctl_tcp_keepalive_time;
 extern int sysctl_tcp_keepalive_probes;
 extern int sysctl_tcp_keepalive_intvl;
+extern int sysctl_tcp_keepalive_intvl_ms;
 extern int sysctl_tcp_syn_retries;
 extern int sysctl_tcp_synack_retries;
 extern int sysctl_tcp_retries1;
 extern int sysctl_tcp_retries2;
+extern int sysctl_tcp_retries3;
 extern int sysctl_tcp_orphan_retries;
 extern int sysctl_tcp_syncookies;
 extern int sysctl_tcp_fastopen;
@@ -526,7 +535,8 @@ enum tcp_tw_status tcp_timewait_state_process(struct inet_timewait_sock *tw,
 					      struct sk_buff *skb,
 					      const struct tcphdr *th);
 struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
-			   struct request_sock *req, bool fastopen);
+			   struct request_sock *req, bool fastopen,
+			   bool fastjoin);
 int tcp_child_process(struct sock *parent, struct sock *child,
 		      struct sk_buff *skb);
 void tcp_enter_loss(struct sock *sk);
@@ -841,6 +851,7 @@ struct tcp_skb_cb {
 
 #ifdef CONFIG_MPTCP
 	__u8		mptcp_flags;	/* flags for the MPTCP layer    */
+	__u8		mptcp_control_flags;
 	__u8		dss_off;	/* Number of 4-byte words until
 					 * seq-number */
 #endif
@@ -870,6 +881,7 @@ struct tcp_skb_cb {
 		union {			/* For MPTCP outgoing frames */
 			__u32 path_mask; /* paths that tried to send this skb */
 			__u32 dss[6];	/* DSS options */
+			__u32	mptcp_seqs[2]; /* For fast join out, 0 is seq, 1 is end_seq */
 		};
 #endif
 	};
@@ -1300,9 +1312,14 @@ extern void tcp_openreq_init_rwin(struct request_sock *req,
 
 void tcp_enter_memory_pressure(struct sock *sk);
 
+static inline int keepalive_intvl_ms_when(const struct tcp_sock *tp)
+{
+	return sysctl_tcp_keepalive_intvl_ms / 1000;
+}
+
 static inline int keepalive_intvl_when(const struct tcp_sock *tp)
 {
-	return tp->keepalive_intvl ? : sysctl_tcp_keepalive_intvl;
+	return tp->keepalive_intvl ? : sysctl_tcp_keepalive_intvl + keepalive_intvl_ms_when(tp);
 }
 
 static inline int keepalive_time_when(const struct tcp_sock *tp)
@@ -1374,6 +1391,7 @@ static inline bool tcp_paws_reject(const struct tcp_options_received *rx_opt,
 	return true;
 }
 
+void tcp_rcv_nxt_update(struct tcp_sock *tp, u32 seq);
 bool tcp_oow_rate_limited(struct net *net, const struct sk_buff *skb,
 			  int mib_idx, u32 *last_oow_ack_time);
 

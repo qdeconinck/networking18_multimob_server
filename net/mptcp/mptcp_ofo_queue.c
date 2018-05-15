@@ -275,6 +275,10 @@ void mptcp_ofo_queue(struct sock *meta_sk)
 
 		__skb_queue_tail(&meta_sk->sk_receive_queue, skb);
 		meta_tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+		if (meta_tp->rcv_nxt == meta_tp->mpcb->idle_for_seq) {
+			mptcp_stop_rcv_timer(meta_sk);
+		}
+
 		mptcp_check_rcvseq_wrap(meta_tp, old_rcv_nxt);
 
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)

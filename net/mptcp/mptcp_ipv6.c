@@ -154,9 +154,7 @@ static int mptcp_v6_join_init_req(struct request_sock *req, struct sock *sk,
 	mtreq->loc_id = loc_id;
 	mtreq->low_prio = low_prio;
 
-	mptcp_join_reqsk_init(mpcb, req, skb);
-
-	return 0;
+	return mptcp_join_reqsk_init(mpcb, req, sk, skb);
 }
 
 /* Similar to tcp6_request_sock_ops */
@@ -186,7 +184,7 @@ static void mptcp_v6_reqsk_queue_hash_add(struct sock *meta_sk,
 	rcu_read_unlock();
 }
 
-static int mptcp_v6_join_request(struct sock *meta_sk, struct sk_buff *skb)
+int mptcp_v6_join_request(struct sock *meta_sk, struct sk_buff *skb)
 {
 	return tcp_conn_request(&mptcp6_request_sock_ops,
 				&mptcp_join_request_sock_ipv6_ops,
@@ -199,7 +197,9 @@ int mptcp_v6_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
 	struct sock *child, *rsk = NULL;
 	int ret;
 
-	if (!(TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_JOIN)) {
+	if (!(TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_JOIN)
+                        && !(TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_FAST_JOIN_IN)
+			&& !(TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_FAST_JOIN_OUT)) {
 		struct tcphdr *th = tcp_hdr(skb);
 		const struct ipv6hdr *ip6h = ipv6_hdr(skb);
 		struct sock *sk;
@@ -257,6 +257,23 @@ int mptcp_v6_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
 		 * by the user.
 		 */
 		ret = tcp_rcv_state_process(child, skb, tcp_hdr(skb), skb->len);
+                if (is_fastjoin_out_syn(tcp_sk(child), skb)) {
+			/* Only process the data if it should be accepted! */
+			if (mpcb->accept_data) {
+				/* Well, a SYN packet in TCP consumes 1 byte; however
+				 * once the connection established, except for the
+				 * DATA FIN, MPTCP does not expect to have "ghost"
+				 * bytes; now that the connection is in established
+				 * state, let's increase by one the seq of the skb
+				 */
+				TCP_SKB_CB(skb)->seq += 1;
+				/* Now actually receive the data contained in the SYN packet */
+				tcp_rcv_established(child, skb, tcp_hdr(skb), skb->len);
+			} else {
+				/* Don't forget then to wait for higher acks */
+				tcp_rcv_nxt_update(tcp_sk(child), TCP_SKB_CB(skb)->end_seq);
+			}
+                }
 		bh_unlock_sock(child);
 		sock_put(child);
 		if (ret) {

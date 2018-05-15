@@ -54,6 +54,10 @@ int mptcp_sub_len_remove_addr_align(u16 bitfield)
 }
 EXPORT_SYMBOL(mptcp_sub_len_remove_addr_align);
 
+int mptcp_sub_len_opaque_align(u32 data_len){
+	return (4 - ((data_len + 3) % 4)) + data_len + 3;
+}
+
 /* get the data-seq and end-data-seq and store them again in the
  * tcp_skb_cb
  */
@@ -344,7 +348,7 @@ static int mptcp_write_dss_mapping(const struct tcp_sock *tp, const struct sk_bu
 }
 
 static int mptcp_write_dss_data_ack(const struct tcp_sock *tp, const struct sk_buff *skb,
-				    __be32 *ptr)
+				    __be32 *ptr, bool last)
 {
 	struct mp_dss *mdss = (struct mp_dss *)ptr;
 	__be32 *start = ptr;
@@ -353,6 +357,8 @@ static int mptcp_write_dss_data_ack(const struct tcp_sock *tp, const struct sk_b
 	mdss->sub = MPTCP_SUB_DSS;
 	mdss->rsv1 = 0;
 	mdss->rsv2 = 0;
+	mdss->r = tp->mptcp->request_rtt;
+	mdss->I = last ? 1 : 0;
 	mdss->F = mptcp_is_data_fin(skb) ? 1 : 0;
 	mdss->m = 0;
 	mdss->M = mptcp_is_data_seq(skb) ? 1 : 0;
@@ -362,6 +368,8 @@ static int mptcp_write_dss_data_ack(const struct tcp_sock *tp, const struct sk_b
 	ptr++;
 
 	*ptr++ = htonl(mptcp_meta_tp(tp)->rcv_nxt);
+
+	tp->mptcp->request_rtt = 0;
 
 	return ptr - start;
 }
@@ -379,14 +387,15 @@ static int mptcp_write_dss_data_ack(const struct tcp_sock *tp, const struct sk_b
  * To avoid this we save the initial DSS mapping which allows us to
  * send the same DSS mapping even for fragmented retransmits.
  */
-static void mptcp_save_dss_data_seq(const struct tcp_sock *tp, struct sk_buff *skb)
+static void mptcp_save_dss_data_seq(const struct tcp_sock *tp,
+				    struct sk_buff *skb, bool last)
 {
 	struct tcp_skb_cb *tcb = TCP_SKB_CB(skb);
 	__be32 *ptr = (__be32 *)tcb->dss;
 
 	tcb->mptcp_flags |= MPTCPHDR_SEQ;
 
-	ptr += mptcp_write_dss_data_ack(tp, skb, ptr);
+	ptr += mptcp_write_dss_data_ack(tp, skb, ptr, last);
 	ptr += mptcp_write_dss_mapping(tp, skb, ptr);
 }
 
@@ -416,6 +425,9 @@ static bool mptcp_skb_entail(struct sock *sk, struct sk_buff *skb, int reinject)
 	const struct mptcp_cb *mpcb = tp->mpcb;
 	struct tcp_skb_cb *tcb;
 	struct sk_buff *subskb = NULL;
+	bool last;
+	struct inet_sock *inet = inet_sk(sk);
+	u16 sport;
 
 	if (!reinject)
 		TCP_SKB_CB(skb)->mptcp_flags |= (mpcb->snd_hiseq_index ?
@@ -453,7 +465,19 @@ static bool mptcp_skb_entail(struct sock *sk, struct sk_buff *skb, int reinject)
 	if (mptcp_is_data_fin(subskb))
 		mptcp_combine_dfin(subskb, meta_sk, sk);
 
-	mptcp_save_dss_data_seq(tp, subskb);
+	/* Need to check if the skb is the last one here because a copy of the
+	 * skb is passed to the function, thus preventing the identification of
+	 * the last packet in mptcp_save_dss_data_seq */
+
+	sport = be16_to_cpu(inet->inet_sport);
+	last = (!tcp_write_queue_tail(meta_sk) ||
+		tcp_skb_is_last(meta_sk, skb));
+
+	/* XXX Fix for Icecast */
+	if (sport == 8000)
+		last = false;
+
+	mptcp_save_dss_data_seq(tp, subskb, last);
 
 	tcb->seq = tp->write_seq;
 	tcb->sacked = 0; /* reset the sacked field: from the point of view
@@ -761,6 +785,14 @@ bool mptcp_write_xmit(struct sock *meta_sk, unsigned int mss_now, int nonagle,
 				  subtp->snd_cwnd);
 	}
 
+	/* If no subflow available but backup ones can be created, open them! */
+	if (!mpcb->close_meta && mpcb->cnt_subflows == 0 && mpcb->pm_ops->push_info) {
+		int have_bup;
+		mpcb->pm_ops->push_info(meta_sk, MPTCP_HAVE_BUP, &have_bup);
+		if (have_bup)
+			mptcp_request_fast_join(meta_sk, mpcb);
+	}
+
 	return !meta_tp->packets_out && tcp_send_head(meta_sk);
 }
 
@@ -841,8 +873,8 @@ u32 __mptcp_select_window(struct sock *sk)
 	return window;
 }
 
-void mptcp_syn_options(const struct sock *sk, struct tcp_out_options *opts,
-		       unsigned *remaining)
+void mptcp_syn_options(const struct sock *sk, struct sk_buff *skb,
+			struct tcp_out_options *opts, unsigned *remaining)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
 
@@ -854,13 +886,42 @@ void mptcp_syn_options(const struct sock *sk, struct tcp_out_options *opts,
 		opts->dss_csum = !!sysctl_mptcp_checksum;
 	} else {
 		const struct mptcp_cb *mpcb = tp->mpcb;
+		const struct tcp_sock *meta_tp = tcp_sk(mptcp_meta_sk(sk));
+		const struct tcp_skb_cb *tcb = TCP_SKB_CB(skb);
+		u8 mptcp_hash_mac[20];
 
-		opts->mptcp_options |= OPTION_MP_JOIN | OPTION_TYPE_SYN;
-		*remaining -= MPTCP_SUB_LEN_JOIN_SYN_ALIGN;
 		opts->mp_join_syns.token = mpcb->mptcp_rem_token;
 		opts->mp_join_syns.low_prio  = tp->mptcp->low_prio;
 		opts->addr_id = tp->mptcp->loc_id;
-		opts->mp_join_syns.sender_nonce = tp->mptcp->mptcp_loc_nonce;
+		opts->mp_join_syns.from_server = mpcb->server_side;
+
+		if (tcb->mptcp_control_flags & MPTCPHDR_FAST_JOIN_IN) {
+			opts->mptcp_options |= OPTION_MP_FAST_JOIN_IN | OPTION_TYPE_SYN;
+			*remaining -= MPTCP_SUB_LEN_FAST_JOIN_IN_SYN_ALIGN;
+			tp->mptcp->sent_data_ack = meta_tp->rcv_nxt;
+			opts->mp_join_syns.data_number = tp->mptcp->sent_data_ack;
+			mptcp_hmac_sha1((u8 *)&mpcb->mptcp_loc_key,
+					(u8 *)&mpcb->mptcp_rem_key,
+					(u8 *)&opts->mp_join_syns.data_number,
+					(u8 *)&mpcb->mptcp_rem_token, (u32 *)mptcp_hash_mac);
+			opts->mp_join_syns.sender_truncated_mac = *(u64 *)mptcp_hash_mac;
+		} else if (tcb->mptcp_control_flags & MPTCPHDR_FAST_JOIN_OUT) {
+			opts->mptcp_options |= OPTION_MP_FAST_JOIN_OUT | OPTION_TYPE_SYN;
+			*remaining -= MPTCP_SUB_LEN_FAST_JOIN_OUT_SYN_ALIGN;
+			tp->mptcp->sent_data_seq = TCP_SKB_CB(skb)->mptcp_seqs[0];
+			opts->mp_join_syns.data_number =
+				tp->mptcp->sent_data_seq;
+			mptcp_hmac_sha1((u8 *)&mpcb->mptcp_loc_key,
+					(u8 *)&mpcb->mptcp_rem_key,
+					(u8 *)&opts->mp_join_syns.data_number,
+					(u8 *)&mpcb->mptcp_rem_token, (u32 *)mptcp_hash_mac);
+			opts->mp_join_syns.sender_truncated_mac_32
+				= *(u32 *) mptcp_hash_mac;
+		} else {
+			opts->mptcp_options |= OPTION_MP_JOIN | OPTION_TYPE_SYN;
+			*remaining -= MPTCP_SUB_LEN_JOIN_SYN_ALIGN;
+			opts->mp_join_syns.sender_nonce = tp->mptcp->mptcp_loc_nonce;
+		}
 	}
 }
 
@@ -877,6 +938,22 @@ void mptcp_synack_options(struct request_sock *req,
 		opts->mp_capable.sender_key = mtreq->mptcp_loc_key;
 		opts->dss_csum = !!sysctl_mptcp_checksum || mtreq->dss_csum;
 		*remaining -= MPTCP_SUB_LEN_CAPABLE_SYN_ALIGN;
+	} else if (mtreq->is_fast_join == MPTCPHDR_FAST_JOIN_IN) {
+		/* Fast join in */
+		opts->mptcp_options |= OPTION_MP_FAST_JOIN_IN | OPTION_TYPE_SYNACK;
+		opts->mp_join_syns.data_number = mtreq->mptcp_data_num;
+		opts->mp_join_syns.sender_truncated_mac = mtreq->mptcp_hash_tmac;
+		opts->mp_join_syns.low_prio = mtreq->low_prio;
+		opts->addr_id = mtreq->loc_id;
+		*remaining -= MPTCP_SUB_LEN_FAST_JOIN_IN_SYNACK_ALIGN;
+	} else if (mtreq->is_fast_join == MPTCPHDR_FAST_JOIN_OUT) {
+		/* Fast join out */
+		opts->mptcp_options |= OPTION_MP_FAST_JOIN_OUT | OPTION_TYPE_SYNACK;
+		opts->mp_join_syns.data_number = mtreq->mptcp_data_num;
+		opts->mp_join_syns.sender_truncated_mac = mtreq->mptcp_hash_tmac;
+		opts->mp_join_syns.low_prio = mtreq->low_prio;
+		opts->addr_id = mtreq->loc_id;
+		*remaining -= MPTCP_SUB_LEN_FAST_JOIN_OUT_SYNACK_ALIGN;
 	} else {
 		opts->mptcp_options |= OPTION_MP_JOIN | OPTION_TYPE_SYNACK;
 		opts->mp_join_syns.sender_truncated_mac =
@@ -985,6 +1062,9 @@ void mptcp_established_options(struct sock *sk, struct sk_buff *skb,
 	if (unlikely(mpcb->addr_signal) && mpcb->pm_ops->addr_signal)
 		mpcb->pm_ops->addr_signal(sk, size, opts, skb);
 
+	if (unlikely(mpcb->opaque_signal) && mpcb->pm_ops->opaque_signal)
+		mpcb->pm_ops->opaque_signal(sk, size, opts, skb);
+
 	if (unlikely(tp->mptcp->send_mp_prio) &&
 	    MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_PRIO_ALIGN) {
 		opts->options |= OPTION_MPTCP;
@@ -992,6 +1072,51 @@ void mptcp_established_options(struct sock *sk, struct sk_buff *skb,
 		if (skb)
 			tp->mptcp->send_mp_prio = 0;
 		*size += MPTCP_SUB_LEN_PRIO_ALIGN;
+	}
+
+	if (unlikely(tp->mptcp->send_rtt) &&
+	    MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_INFO_RTT_ALIGN) {
+		opts->options |= OPTION_MPTCP;
+		opts->mptcp_options |= OPTION_MP_INFO;
+		opts->mp_info_val |= (1 << MPTCP_SUB_INFO_RTT);
+		opts->snd_srtt_us = tp->srtt_us;
+		opts->snd_rttvar_us = tp->rttvar_us;
+
+
+		*size += MPTCP_SUB_LEN_INFO_RTT_ALIGN;
+	}
+
+	if (unlikely(!list_empty(&mpcb->conn_list)) &&
+	    MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_INFO_CONNECTIVITY_ALIGN) {
+		struct mptcp_connectivity *mc;
+		spin_lock_bh(&mpcb->conn_lock);
+		mc = list_entry(mpcb->conn_list.next,
+			struct mptcp_connectivity, list);
+		opts->options |= OPTION_MPTCP;
+		opts->mptcp_options |= OPTION_MP_INFO;
+		opts->mp_info_val |= (1 << MPTCP_SUB_INFO_CONNECTIVITY);
+		opts->snd_loc_id = mc->snd_loc_id;
+		opts->snd_rem_id = mc->snd_rem_id;
+		list_del(mpcb->conn_list.next);
+		kfree(mc);
+		spin_unlock_bh(&mpcb->conn_lock);
+
+		*size += MPTCP_SUB_LEN_INFO_CONNECTIVITY_ALIGN;
+	}
+
+	if (unlikely(tp->mptcp->send_rto) &&
+			MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_INFO_RTO_ALIGN) {
+		/* XXX Fix for Icecast */
+		struct inet_sock *inet = inet_sk(sk);
+		u16 sport = be16_to_cpu(inet->inet_sport);
+		opts->options |= OPTION_MPTCP;
+		opts->mptcp_options |= OPTION_MP_INFO;
+		opts->mp_info_val |= (1 << MPTCP_SUB_INFO_RTO);
+		opts->snd_rto_us = jiffies_to_usecs(inet_csk(sk)->icsk_rto);
+		if (sport == 8000)
+			opts->snd_rto_us = max(opts->snd_rto_us, 1500000);
+
+		*size += MPTCP_SUB_LEN_INFO_RTO_ALIGN;
 	}
 
 	return;
@@ -1067,28 +1192,131 @@ void mptcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 			ptr += MPTCP_SUB_LEN_JOIN_ACK_ALIGN >> 2;
 		}
 	}
+	if (unlikely(OPTION_MP_FAST_JOIN_IN & opts->mptcp_options)) {
+		struct mp_fast_join_in *mpfji = (struct mp_fast_join_in *)ptr;
+
+		mpfji->kind = TCPOPT_MPTCP;
+		mpfji->sub = MPTCP_SUB_FAST_JOIN_IN;
+		mpfji->rsv = 0;
+		mpfji->extended = 0;
+
+		if (OPTION_TYPE_SYN & opts->mptcp_options) {
+			mpfji->len = MPTCP_SUB_LEN_FAST_JOIN_IN_SYN;
+			mpfji->u.syn.token = opts->mp_join_syns.token;
+			mpfji->u.syn.data_ack = opts->mp_join_syns.data_number;
+			mpfji->u.syn.mac = opts->mp_join_syns.sender_truncated_mac;
+			mpfji->b = opts->mp_join_syns.low_prio;
+			mpfji->from_server = opts->mp_join_syns.from_server;
+			mpfji->addr_id = opts->addr_id;
+			ptr += MPTCP_SUB_LEN_FAST_JOIN_IN_SYN_ALIGN >> 2;
+		} else if (OPTION_TYPE_SYNACK & opts->mptcp_options) {
+			mpfji->len = MPTCP_SUB_LEN_FAST_JOIN_IN_SYNACK;
+			mpfji->u.synack.data_seq = opts->mp_join_syns.data_number;
+			mpfji->u.synack.mac = opts->mp_join_syns.sender_truncated_mac;
+			mpfji->b = opts->mp_join_syns.low_prio;
+			mpfji->addr_id = opts->addr_id;
+			ptr += MPTCP_SUB_LEN_FAST_JOIN_IN_SYNACK_ALIGN >> 2;
+		}
+	}
+	if (unlikely(OPTION_MP_FAST_JOIN_OUT & opts->mptcp_options)) {
+		struct mp_fast_join_out *mpfjo = (struct mp_fast_join_out *)ptr;
+
+		mpfjo->kind = TCPOPT_MPTCP;
+		mpfjo->sub = MPTCP_SUB_FAST_JOIN_OUT;
+		mpfjo->rsv = 0;
+		mpfjo->extended = 0;
+
+		if (OPTION_TYPE_SYN & opts->mptcp_options) {
+			const struct tcp_skb_cb *tcb =
+						TCP_SKB_CB(skb);
+			mpfjo->len = MPTCP_SUB_LEN_FAST_JOIN_OUT_SYN;
+			mpfjo->u.syn.token = opts->mp_join_syns.token;
+			mpfjo->u.syn.data_seq = opts->mp_join_syns.data_number;
+			mpfjo->u.syn.mac =
+				opts->mp_join_syns.sender_truncated_mac_32;
+			mpfjo->b = opts->mp_join_syns.low_prio;
+			mpfjo->from_server = opts->mp_join_syns.from_server;
+			mpfjo->addr_id = opts->addr_id;
+			ptr += (MPTCP_SUB_LEN_FAST_JOIN_OUT_SYN_ALIGN - 1) >> 2;
+			/* Don't forget that the SYN uses one byte! */
+			*ptr++ = htonl((tcb->end_seq - tcb->seq - 1) << 16 |
+					(TCPOPT_NOP << 8) |
+					TCPOPT_NOP);
+		} else if (OPTION_TYPE_SYNACK & opts->mptcp_options) {
+			mpfjo->len = MPTCP_SUB_LEN_FAST_JOIN_OUT_SYNACK;
+			mpfjo->u.synack.data_ack =
+				opts->mp_join_syns.data_number;
+			mpfjo->u.synack.mac =
+				opts->mp_join_syns.sender_truncated_mac;
+			mpfjo->b = opts->mp_join_syns.low_prio;
+			mpfjo->addr_id = opts->addr_id;
+			ptr += MPTCP_SUB_LEN_FAST_JOIN_OUT_SYNACK_ALIGN >> 2;
+		}
+	}
 	if (unlikely(OPTION_ADD_ADDR & opts->mptcp_options)) {
 		struct mp_add_addr *mpadd = (struct mp_add_addr *)ptr;
 
 		mpadd->kind = TCPOPT_MPTCP;
 		if (opts->add_addr_v4) {
-			mpadd->len = MPTCP_SUB_LEN_ADD_ADDR4;
 			mpadd->sub = MPTCP_SUB_ADD_ADDR;
 			mpadd->ipver = 4;
 			mpadd->addr_id = opts->add_addr4.addr_id;
 			mpadd->u.v4.addr = opts->add_addr4.addr;
-			ptr += MPTCP_SUB_LEN_ADD_ADDR4_ALIGN >> 2;
+			if (opts->add_addr4.port) {
+				mpadd->len = MPTCP_SUB_LEN_ADD_ADDR4_PORT;
+				mpadd->u.v4.port = htons(opts->add_addr4.port);
+				*(ptr + (MPTCP_SUB_LEN_ADD_ADDR4_PORT >> 2)) &=
+					htonl(0xffff0000);
+				*(ptr + (MPTCP_SUB_LEN_ADD_ADDR4_PORT >> 2)) |=
+					htonl((TCPOPT_NOP << 8) | TCPOPT_NOP);
+				ptr += MPTCP_SUB_LEN_ADD_ADDR4_PORT_ALIGN >> 2;
+			} else {
+				mpadd->len = MPTCP_SUB_LEN_ADD_ADDR4;
+				ptr += MPTCP_SUB_LEN_ADD_ADDR4_ALIGN >> 2;
+			}
 		} else if (opts->add_addr_v6) {
-			mpadd->len = MPTCP_SUB_LEN_ADD_ADDR6;
 			mpadd->sub = MPTCP_SUB_ADD_ADDR;
 			mpadd->ipver = 6;
 			mpadd->addr_id = opts->add_addr6.addr_id;
 			memcpy(&mpadd->u.v6.addr, &opts->add_addr6.addr,
 			       sizeof(mpadd->u.v6.addr));
-			ptr += MPTCP_SUB_LEN_ADD_ADDR6_ALIGN >> 2;
+			if (opts->add_addr6.port) {
+				mpadd->len = MPTCP_SUB_LEN_ADD_ADDR6_PORT;
+				mpadd->u.v6.port = htons(opts->add_addr6.port);
+				*(ptr + (MPTCP_SUB_LEN_ADD_ADDR6_PORT >> 2)) &=
+					htonl(0xffff0000);
+				*(ptr + (MPTCP_SUB_LEN_ADD_ADDR6_PORT >> 2)) |=
+					htonl((TCPOPT_NOP << 8) | TCPOPT_NOP);
+				ptr += MPTCP_SUB_LEN_ADD_ADDR6_PORT_ALIGN >> 2;
+			} else {
+				mpadd->len = MPTCP_SUB_LEN_ADD_ADDR6;
+				ptr += MPTCP_SUB_LEN_ADD_ADDR6_ALIGN >> 2;
+			}
 		}
 
 		MPTCP_INC_STATS(sock_net((struct sock *)tp), MPTCP_MIB_ADDADDRTX);
+	}
+	if (unlikely(OPTION_OPAQUE & opts->mptcp_options)) {
+		struct mp_opaque *mpo = (struct mp_opaque *)ptr;
+		int len, len_align;
+
+		len = opts->opaque_len + 3;
+		len_align = mptcp_sub_len_opaque_align(opts->opaque_len);
+
+		mpo->kind = TCPOPT_MPTCP;
+		mpo->len = opts->opaque_len + 3;
+		mpo->sub = MPTCP_SUB_OPAQUE;
+		mpo->rsv = 0;
+		memcpy(&mpo->data, opts->opaque_data, opts->opaque_len);
+
+		if (len_align > len) {
+			int i;
+			for (i = 0; i < len_align - len; i++)
+				*(&mpo->data + opts->opaque_len + i) = TCPOPT_NOP;
+		}
+		printk("%s putting option ... len align : %d\n", __func__, len_align);
+
+		ptr += len_align >> 2;
 	}
 	if (unlikely(OPTION_REMOVE_ADDR & opts->mptcp_options)) {
 		struct mp_remove_addr *mprem = (struct mp_remove_addr *)ptr;
@@ -1145,7 +1373,10 @@ void mptcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 
 	if (OPTION_DATA_ACK & opts->mptcp_options) {
 		if (!mptcp_is_data_seq(skb))
-			ptr += mptcp_write_dss_data_ack(tp, skb, ptr);
+			/* The idle bit is taken into account only if data is
+			 * present. Therefore, set last to false here.
+			 */
+			ptr += mptcp_write_dss_data_ack(tp, skb, ptr, false);
 		else
 			ptr += mptcp_write_dss_data_seq(tp, skb, ptr);
 	}
@@ -1160,6 +1391,54 @@ void mptcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 		mpprio->addr_id = TCPOPT_NOP;
 
 		ptr += MPTCP_SUB_LEN_PRIO_ALIGN >> 2;
+	}
+	if (unlikely(OPTION_MP_INFO & opts->mptcp_options)) {
+		/* Several sub options may be given */
+		struct mp_info *mpinfo;
+
+		if ((1 << MPTCP_SUB_INFO_RTT) & opts->mp_info_val) {
+			mpinfo = (struct mp_info *)ptr;
+			mpinfo->kind = TCPOPT_MPTCP;
+			mpinfo->len = MPTCP_SUB_LEN_INFO_RTT;
+			mpinfo->sub = MPTCP_SUB_INFO;
+			mpinfo->rsv = 0;
+			mpinfo->val = MPTCP_SUB_INFO_RTT;
+			mpinfo->u.rtt.srtt_us = opts->snd_srtt_us;
+			mpinfo->u.rtt.rttvar_us = opts->snd_rttvar_us;
+
+			tp->mptcp->send_rtt = 0;
+
+			ptr += MPTCP_SUB_LEN_INFO_RTT_ALIGN >> 2;
+		}
+
+		if ((1 << MPTCP_SUB_INFO_CONNECTIVITY) & opts->mp_info_val) {
+			mpinfo = (struct mp_info *)ptr;
+			mpinfo->kind = TCPOPT_MPTCP;
+			mpinfo->len = MPTCP_SUB_LEN_INFO_CONNECTIVITY;
+			mpinfo->sub = MPTCP_SUB_INFO;
+			mpinfo->rsv = 0;
+			mpinfo->val = MPTCP_SUB_INFO_CONNECTIVITY;
+			mpinfo->u.conn.snd_rem_id = opts->snd_rem_id;
+			mpinfo->u.conn.snd_loc_id = opts->snd_loc_id;
+			mpinfo->u.conn.nop1 = TCPOPT_NOP;
+			mpinfo->u.conn.nop2 = TCPOPT_NOP;
+
+			ptr += MPTCP_SUB_LEN_INFO_CONNECTIVITY_ALIGN >> 2;
+		}
+
+		if ((1 << MPTCP_SUB_INFO_RTO) & opts->mp_info_val) {
+			mpinfo = (struct mp_info *)ptr;
+			mpinfo->kind = TCPOPT_MPTCP;
+			mpinfo->len = MPTCP_SUB_LEN_INFO_RTO;
+			mpinfo->sub = MPTCP_SUB_INFO;
+			mpinfo->rsv = 0;
+			mpinfo->val = MPTCP_SUB_INFO_RTO;
+			mpinfo->u.rto.rto_us = opts->snd_rto_us;
+
+			tp->mptcp->send_rto = 0;
+
+			ptr += MPTCP_SUB_LEN_INFO_RTO_ALIGN >> 2;
+		}
 	}
 }
 

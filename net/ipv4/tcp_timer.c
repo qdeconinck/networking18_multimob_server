@@ -28,8 +28,10 @@ int sysctl_tcp_synack_retries __read_mostly = TCP_SYNACK_RETRIES;
 int sysctl_tcp_keepalive_time __read_mostly = TCP_KEEPALIVE_TIME;
 int sysctl_tcp_keepalive_probes __read_mostly = TCP_KEEPALIVE_PROBES;
 int sysctl_tcp_keepalive_intvl __read_mostly = TCP_KEEPALIVE_INTVL;
+int sysctl_tcp_keepalive_intvl_ms __read_mostly = TCP_KEEPALIVE_INTVL_MS;
 int sysctl_tcp_retries1 __read_mostly = TCP_RETR1;
 int sysctl_tcp_retries2 __read_mostly = TCP_RETR2;
+int sysctl_tcp_retries3 __read_mostly = TCP_RETR3;
 int sysctl_tcp_orphan_retries __read_mostly;
 int sysctl_tcp_thin_linear_timeouts __read_mostly;
 
@@ -159,8 +161,14 @@ int tcp_write_timeout(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	int retry_until;
+	int retry_until, retry_sub_until;
 	bool do_reset, syn_set = false;
+
+	if (sk->sk_state == TCP_CLOSE) {
+		/* Connection died meantime... */
+		tcp_write_err(sk);
+		return 1;
+	}
 
 	if ((1 << sk->sk_state) & (TCPF_SYN_SENT | TCPF_SYN_RECV)) {
 		if (icsk->icsk_retransmits) {
@@ -172,6 +180,7 @@ int tcp_write_timeout(struct sock *sk)
 						 LINUX_MIB_TCPFASTOPENACTIVEFAIL);
 		}
 		retry_until = icsk->icsk_syn_retries ? : sysctl_tcp_syn_retries;
+		retry_sub_until = icsk->icsk_syn_retries ? : sysctl_tcp_syn_retries;
 		syn_set = true;
 		/* Stop retransmitting MP_CAPABLE options in SYN if timed out. */
 		if (tcp_sk(sk)->request_mptcp &&
@@ -189,16 +198,33 @@ int tcp_write_timeout(struct sock *sk)
 		}
 
 		retry_until = sysctl_tcp_retries2;
+		retry_sub_until = sysctl_tcp_retries3;
 		if (sock_flag(sk, SOCK_DEAD)) {
 			const int alive = icsk->icsk_rto < TCP_RTO_MAX;
 
 			retry_until = tcp_orphan_retries(sk, alive);
 			do_reset = alive ||
-				!retransmits_timed_out(sk, retry_until, 0, 0);
+				(mptcp(tp) && !is_meta_sk(sk) &&
+				 !retransmits_timed_out(sk, retry_sub_until, 0, 0))
+				|| !retransmits_timed_out(sk, retry_until, 0, 0);
 
 			if (tcp_out_of_resources(sk, do_reset))
 				return 1;
 		}
+	}
+
+	if (mptcp(tp) && !is_meta_sk(sk) &&
+	    retransmits_timed_out(sk, retry_sub_until,
+				  syn_set ? 0 : icsk->icsk_user_timeout, syn_set)) {
+		/* The Multipath TCP subflow seems dead, kill it */
+		local_bh_disable();
+		mptcp_sub_force_close(sk);
+		local_bh_enable();
+		return 1;
+	}
+
+	if (mptcp(tp) && !is_meta_sk(sk) && sysctl_mptcp_active_bk) {
+		/* Let the oracle trigger the subflow creation, if needed... */
 	}
 
 	if (retransmits_timed_out(sk, retry_until,
@@ -582,6 +608,7 @@ static void tcp_keepalive_timer (unsigned long data)
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct sock *meta_sk = mptcp(tp) ? mptcp_meta_sk(sk) : sk;
+	struct mptcp_cb *mpcb = mptcp(tp) ? tp->mpcb : NULL;
 	u32 elapsed;
 
 	/* Only process if socket is not in use. */
@@ -656,6 +683,21 @@ static void tcp_keepalive_timer (unsigned long data)
 			tcp_write_err(sk);
 			goto out;
 		}
+		/* If no ACK received since the probe was sent, trigger FAST
+		 * JOIN IN
+		 */
+#ifdef CONFIG_MPTCP_ORACLE
+		if (mpcb && icsk->icsk_probes_out >= sysctl_mptcp_keepalive_probes_fastjoin && mpcb->cnt_established == 1) {
+			struct mptcp_oracle_entry *entry = mpcb->connection_list->oracle_entry;
+			pr_alert("Inside!\n");
+			if (entry) {
+				mptcp_icsk_probes_threshold_exceeded(entry);
+				/* No need to continue keepalives */
+				inet_csk_delete_keepalive_timer(sk);
+				goto out;
+			}
+		}
+#endif
 		if (tp->ops->write_wakeup(sk) <= 0) {
 			icsk->icsk_probes_out++;
 			elapsed = keepalive_intvl_when(tp);
@@ -684,9 +726,80 @@ out:
 	sock_put(sk);
 }
 
+static void tcp_receive_timer(unsigned long data)
+{
+	struct sock *sk = (struct sock *) data;
+	//struct inet_connection_sock *icsk = inet_csk(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct sock *meta_sk = mptcp(tp) ? mptcp_meta_sk(sk) : sk;
+	//u32 elapsed;
+
+	/* Only process if socket is not in use. */
+	bh_lock_sock(meta_sk);
+	if (sock_owned_by_user(meta_sk)) {
+		/* Try again later. */
+		sk_reset_timer(sk, &sk->sk_rcv_timer, jiffies + HZ/20);
+		goto out;
+	}
+
+	if (!sysctl_mptcp_active_bk) {
+		pr_err("Shouldn't be in receive timer with sysctl_mptcp_active_bk to 0\n");
+		goto out;
+	}
+
+	if (sk->sk_state == TCP_LISTEN) {
+		pr_err("Hmm... receive timer on a LISTEN ???\n");
+		goto out;
+	}
+
+	if (sk->sk_state == TCP_FIN_WAIT2 && sock_flag(sk, SOCK_DEAD)) {
+		if (tp->linger2 >= 0) {
+			const int tmo = tcp_fin_time(sk) - TCP_TIMEWAIT_LEN;
+
+			if (tmo > 0) {
+				tp->ops->time_wait(sk, TCP_FIN_WAIT2, tmo);
+				goto out;
+			}
+		}
+		tp->ops->send_active_reset(sk, GFP_ATOMIC);
+		goto death;
+	}
+
+	if (sk->sk_state == TCP_CLOSE)
+		goto out;
+
+#ifdef CONFIG_MPTCP_ORACLE
+	if (mptcp(tp) && tcp_sk(meta_sk)->mpcb->mp_idle) {
+		pr_alert("Firing in receive timer but connection is idle...\n");
+	}
+	if (mptcp(tp) && tcp_sk(meta_sk)->rcv_nxt == tcp_sk(meta_sk)->mpcb->idle_for_seq) {
+		pr_alert("Prevent useless receive timer firing\n");
+		goto reclaim;
+	}
+	mptcp_receive_timer_expired(tp->oracle_entry, mptcp_meta_sk(sk));
+	goto reclaim;
+#endif
+	if (mptcp_should_request_fastjoin(tp))
+		mptcp_request_fast_join(meta_sk, tp->mpcb);
+
+reclaim:
+	sk_mem_reclaim(sk);
+
+	goto out;
+
+death:
+	tcp_done(sk);
+
+out:
+	bh_unlock_sock(meta_sk);
+	sock_put(sk);
+}
+
 void tcp_init_xmit_timers(struct sock *sk)
 {
+	// TODO seems need to create a new timer and register it here!
 	inet_csk_init_xmit_timers(sk, &tcp_write_timer, &tcp_delack_timer,
-				  &tcp_keepalive_timer);
+				  &tcp_keepalive_timer,
+				  &tcp_receive_timer);
 }
 EXPORT_SYMBOL(tcp_init_xmit_timers);
